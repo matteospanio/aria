@@ -174,14 +174,14 @@ CUDA_LDFLAGS := -fopenmp -lm -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 
 # build the lib (+ aria_cuda.o) and CLI with the CUDA backend linked in
 cuda:
 	rm -f $(BUILD)/*.o $(BUILD)/libaria.a aria   # CFLAGS change; keep dumps
-	$(NVCC) -ccbin $(CUDA_CCBIN) -arch=$(CUDA_ARCH) -O3 --default-stream per-thread -I$(SRC) -c $(SRC)/aria_cuda.cu -o $(BUILD)/aria_cuda.o
+	$(NVCC) -ccbin "$(CUDA_CCBIN)" -arch=$(CUDA_ARCH) -O3 --default-stream per-thread -I$(SRC) -c $(SRC)/aria_cuda.cu -o $(BUILD)/aria_cuda.o
 	$(MAKE) aria CFLAGS="$(CUDA_CFLAGS)" LDFLAGS="$(CUDA_LDFLAGS)" EXTRA_LIB_OBJS="$(BUILD)/aria_cuda.o"
 	$(MAKE) aria-server CFLAGS="$(CUDA_CFLAGS)" LDFLAGS="$(CUDA_LDFLAGS)" EXTRA_LIB_OBJS="$(BUILD)/aria_cuda.o"
 
 # CUDA op parity vs CPU (skips cleanly if no device)
 test_cuda:
 	rm -f $(BUILD)/*.o $(BUILD)/libaria.a
-	$(NVCC) -ccbin $(CUDA_CCBIN) -arch=$(CUDA_ARCH) -O3 --default-stream per-thread -I$(SRC) -c $(SRC)/aria_cuda.cu -o $(BUILD)/aria_cuda.o
+	$(NVCC) -ccbin "$(CUDA_CCBIN)" -arch=$(CUDA_ARCH) -O3 --default-stream per-thread -I$(SRC) -c $(SRC)/aria_cuda.cu -o $(BUILD)/aria_cuda.o
 	$(MAKE) $(LIB) CFLAGS="$(CUDA_CFLAGS)" EXTRA_LIB_OBJS="$(BUILD)/aria_cuda.o"
 	$(CC) $(CUDA_CFLAGS) -I$(SRC) tests/test_cuda.c -L$(BUILD) -laria $(CUDA_LDFLAGS) -o $(BUILD)/test_cuda
 	$(BUILD)/test_cuda

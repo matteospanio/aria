@@ -20,9 +20,22 @@
 #include <string.h>
 #include <time.h>
 #include <math.h>        /* sqrt for the phase-aligned crossfade */
+#ifdef _WIN32
+#include "aria_pthread_compat.h"
+#else
 #include <pthread.h>     /* writer thread so generation overlaps playback (--stream -o -) */
+#endif
+#ifndef _WIN32
 #include <unistd.h>      /* isatty */
 #include <sys/select.h>  /* non-blocking stdin for live --stream prompting */
+#else
+#include <io.h>
+#include <fcntl.h>       /* _O_BINARY for raw f32 on stdout (--stream -o -) */
+#define isatty _isatty
+/* _putenv_s always overwrites; honour the overwrite=0 flag explicitly so a
+ * user-provided OMP_WAIT_POLICY still wins (see main()). */
+#define setenv(k, v, o) (((o) || !getenv(k)) ? _putenv_s((k), (v)) : 0)
+#endif
 
 /* per-step progress, drawn on one line; only attached when stderr is a TTY */
 static void cli_progress(int step, int total, void *user) {
@@ -382,8 +395,12 @@ static int cmd_hpss_test(const char *in) {
     return 0;
 }
 
-/* read a new prompt from stdin if a line is waiting (non-blocking); 1 if updated */
+/* read a new prompt from stdin if a line is waiting (non-blocking); 1 if updated.
+ * POSIX only: select() on fd 0. Windows has no equivalent for a console/pipe
+ * handle, so the shim is a no-op there and cmd_stream() does not advertise live
+ * re-steering on that platform. */
 static int stream_poll_prompt(char *buf, size_t cap) {
+#ifndef _WIN32
     fd_set fds; FD_ZERO(&fds); FD_SET(0, &fds);
     struct timeval tv = {0, 0};
     if (select(1, &fds, NULL, NULL, &tv) > 0 && FD_ISSET(0, &fds) && fgets(buf, (int)cap, stdin)) {
@@ -391,6 +408,10 @@ static int stream_poll_prompt(char *buf, size_t cap) {
         while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
         return n > 0;
     }
+#else
+    (void)buf;
+    (void)cap;
+#endif
     return 0;
 }
 
@@ -522,7 +543,11 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
     const float skip_s = 1.5f, tail_s = 3.0f, xfade_s = 0.25f;   /* seam / fade / crossfade */
     int64_t ctx_fr = (int64_t)(context_s * sr), xf_fr = (int64_t)(xfade_s * sr);
     int64_t maxlag = (int64_t)(0.18f * sr);   /* phase-align search range (~< one beat) */
+#ifdef _WIN32
+    int interactive = 0;                    /* stream_poll_prompt is a no-op on Windows */
+#else
     int interactive = isatty(fileno(stdin));
+#endif
     char promptbuf[1024];
     float *held = NULL; int64_t held_len = 0; const char *held_prompt = NULL;  /* --hold drum loop */
     /* E14b re-anchoring: keep the chunk-0 context tail as an energy/character reference and
@@ -537,6 +562,9 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
      * re-seeds every N chunks for fresh variation. */
     int64_t base_seed = p->seed; int evolve_k = 0;
     int to_stdout = (strcmp(out_path, "-") == 0);   /* -o - : stream raw f32 to stdout for a player */
+#ifdef _WIN32
+    if (to_stdout) _setmode(_fileno(stdout), _O_BINARY);   /* text mode would turn every 0x0A into CRLF */
+#endif
     int64_t emitted = 0;
     squeue q = { .m = PTHREAD_MUTEX_INITIALIZER, .ne = PTHREAD_COND_INITIALIZER, .nf = PTHREAD_COND_INITIALIZER };
     pthread_t writer; int have_writer = 0;

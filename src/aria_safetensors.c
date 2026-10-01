@@ -3,12 +3,15 @@
  */
 
 #include "aria_safetensors.h"
+#include "aria_win_compat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#ifndef _WIN32
 #include <unistd.h>
 #include <sys/mman.h>
+#endif
 #include <sys/stat.h>
 
 /* ---- minimal JSON scanning for the safetensors header ---- */
@@ -182,8 +185,13 @@ safetensors_file_t *safetensors_open(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("safetensors_open: open"); return NULL; }
 
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_fstat64(fd, &st) < 0) { perror("safetensors_open: fstat"); _close(fd); return NULL; }
+#else
     struct stat st;
     if (fstat(fd, &st) < 0) { perror("safetensors_open: fstat"); close(fd); return NULL; }
+#endif
     size_t file_size = (size_t)st.st_size;
     if (file_size < 8) { fprintf(stderr, "safetensors_open: file too small\n"); close(fd); return NULL; }
 

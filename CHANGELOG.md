@@ -5,6 +5,36 @@ All notable changes to *aria* are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - Unreleased
+
+Native Windows build support: the same runtime, compiled for Windows x64 with MSVC, optionally
+with the CUDA backend.
+
+### Added
+
+- Native Windows x64 build with `build.bat`, the Makefile's counterpart (`build.bat`,
+  `build.bat test`, `build.bat cuda`). The C sources compile with MSVC; the CUDA build uses the
+  same `nvcc` flags and cuBLAS as on Linux. No Python, PyTorch, or second ML stack at runtime.
+- Windows compatibility header (`aria_win_compat.h`, force-included) for what the sources assumed
+  from the platform: 64-bit `CreateFileMapping`/`MapViewOfFile` safetensors mapping,
+  `clock_gettime` via `QueryPerformanceCounter`, `MAP_*`/`madvise`/`sysconf` shims, `strtok_r`,
+  and `__thread`. CRT differences are handled where they occur: `isatty`/`setenv` and binary
+  `stdout` for `--stream -o -` in `main.c`, `_aligned_malloc` for the scratch arena.
+- Windows-safe large-file handling for model and config files (`_fstat64`, `_fseeki64`/`_ftelli64`
+  instead of 32-bit `long` offsets).
+- A `pthread` shim for MSVC built on `SRWLOCK` + `SleepConditionVariableSRW` (both statically
+  initializable, so no lazy init) with `_beginthreadex` threads.
+- Windows CI: an MSVC CPU build running the hermetic unit tests, and an MSVC + CUDA build.
+
+### Compatibility
+
+- The POSIX build is unchanged.
+- Not ported yet: live prompt re-steering during `--stream` (it relies on `select()` over fd 0;
+  Windows does not advertise it) and `aria-server` (BSD sockets).
+- The MSVC build compiles the scalar, single-threaded CPU kernels (no OpenMP or AVX2 yet); use
+  `--device cuda` on Windows. `madvise` is a no-op there, so host weights stay mapped after the
+  GPU upload.
+
 ## [0.1.0] - 2026-07-08
 
 First public release: a dependency-free C/CUDA runtime for Stable Audio 3.
@@ -38,4 +68,5 @@ First public release: a dependency-free C/CUDA runtime for Stable Audio 3.
   (`README.md`, `BENCHMARKS.md`, `PROFILING.md`).
 
 [Unreleased]: https://github.com/matteospanio/aria/compare/v0.1.0...HEAD
+[0.2.0]: https://github.com/matteospanio/aria/releases/tag/v0.2.0
 [0.1.0]: https://github.com/matteospanio/aria/releases/tag/v0.1.0

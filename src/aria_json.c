@@ -10,9 +10,15 @@
 char *aria_read_file(const char *path, size_t *out_len) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
+#ifdef _WIN32
+    _fseeki64(f, 0, SEEK_END);
+    __int64 sz = _ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
+#else
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
+#endif
     if (sz < 0) { fclose(f); return NULL; }
     char *buf = malloc((size_t)sz + 1);
     if (!buf) { fclose(f); return NULL; }

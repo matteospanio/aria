@@ -41,6 +41,8 @@ python3 -m pip install -U huggingface_hub
 
 ## Build
 
+### Linux / POSIX
+
 ```sh
 make                        # CPU build -> ./aria + build/libaria.a (default)
 make test                   # hermetic unit tests (no model, no GPU)
@@ -49,6 +51,21 @@ make clean
 ```
 
 Requirements: a C11 compiler (gcc/clang), `make`, libm, and OpenMP. No BLAS, no libsndfile, no JSON library. The CPU build stays warning-clean under `-Wall -Wextra`.
+
+### Windows (MSVC, optional CUDA)
+
+`build.bat` is the Makefile's Windows counterpart. Run it from an *x64 Native Tools Command Prompt for VS 2019/2022*:
+
+```bat
+rem CPU build: build\aria.exe + build\libaria.lib
+build.bat
+rem CPU build + hermetic unit tests (no model, no GPU)
+build.bat test
+rem CUDA build: needs the CUDA Toolkit; set ARIA_CUDA_ARCH first (default sm_86)
+build.bat cuda
+```
+
+Usage is the same as on Linux, with `build\aria.exe` in place of `./aria`. The CUDA build needs the NVIDIA driver and the CUDA Toolkit's cuBLAS DLLs on `PATH` at runtime. Not ported yet: live prompt re-steering during `--stream`, and `aria-server` (both POSIX-only). The MSVC build compiles the scalar, single-threaded CPU kernels (no OpenMP or AVX2 yet), so use `--device cuda` on Windows.
 
 ## Usage
 

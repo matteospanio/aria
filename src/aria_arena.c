@@ -4,6 +4,11 @@
 
 #include "aria_arena.h"
 #include <stdlib.h>
+#ifdef _WIN32
+#include <malloc.h>
+/* MSVC has no aligned_alloc; plain malloc is only 16-aligned (test_arena checks 64) */
+#define aligned_alloc(alignment, size) _aligned_malloc((size), (alignment))
+#endif
 
 #define ARIA_ARENA_ALIGN 64
 
@@ -18,7 +23,11 @@ int aria_arena_init(aria_arena *a, size_t cap) {
 
 void aria_arena_free(aria_arena *a) {
     if (!a) return;
+#ifdef _WIN32
+    _aligned_free(a->base);   /* _aligned_malloc memory must not go through free() */
+#else
     free(a->base);
+#endif
     a->base = NULL;
     a->cap = a->used = a->peak = 0;
 }
