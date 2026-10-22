@@ -7,17 +7,16 @@
 <meta name="description" content="aria is a dependency-free C/CUDA runtime that runs Stable Audio 3 on GPUs, CPU-only machines and a Raspberry Pi 5, with 8-bit quantization at no measurable quality cost and built-in activation steering. IEEE IS2 2026.">
 <style>
 :root {
-  --plum: #33224A; --plum-2: #4A3566; --lav: #CDBFE0;
-  --bg: #F3F0F7; --card: #FFFFFF; --ink: #1F1828; --muted: #6B6478; --rule: #DDD7E5;
-  --head: var(--plum); --link: #5B3E80;
-  --sweet: #D55E00; --sour: #009E73; --bitter: #4D4D4D; --salty: #0072B2; --spicy: #E69F00;
-  --good: #009E73; --bad: #D55E00;
-  --code-bg: #F6F4F9;
+  --bg: #FFFFFF; --surface: #F6F6F4; --ink: #18181B; --muted: #64646C; --rule: #E5E5E2;
+  --accent: #33224A; --accent-soft: #EFECF4; --on-accent: #FFFFFF;
+  --sweet: #D55E00; --sour: #009E73; --bitter: #6B6B6B; --salty: #0072B2; --spicy: #E69F00;
+  --good: #00835F; --bad: #C24F00;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #15111C; --card: #1F1929; --ink: #ECE8F2; --muted: #A59CB3; --rule: #3A3147;
-    --head: #C9B6EA; --link: #C9B6EA; --bitter: #A8A8A8; --code-bg: #191421;
+    --bg: #111113; --surface: #1B1B1E; --ink: #EDEDEF; --muted: #9D9DA6; --rule: #2B2B30;
+    --accent: #BBA8E2; --accent-soft: #24202D; --on-accent: #16121D;
+    --bitter: #A6A6A6; --good: #3CC59A; --bad: #F08A3E;
   }
 }
 * { box-sizing: border-box; }
@@ -26,61 +25,62 @@ body {
   margin: 0; background: var(--bg); color: var(--ink);
   font: 17px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, "Source Sans 3", "Helvetica Neue", Arial, sans-serif;
 }
-a { color: var(--link); }
+a { color: var(--accent); text-underline-offset: 2px; }
 img, svg { max-width: 100%; }
 .wrap { max-width: 1000px; margin: 0 auto; padding: 0 16px; }
 
-/* ---------- hero ---------- */
-.hero { background: var(--plum); color: #fff; position: relative; overflow: hidden; }
-.hero .tab { position: absolute; top: 0; left: 0; height: 64px; }
-.hero .wrap { padding-top: 104px; padding-bottom: 48px; }
-.chip { display: inline-block; font-size: 14px; font-weight: 600; letter-spacing: .02em;
-  padding: 3px 12px; border-radius: 999px; background: rgba(255,255,255,.12); color: var(--lav); }
-h1 { font-size: clamp(30px, 5vw, 48px); line-height: 1.12; margin: 14px 0 18px; letter-spacing: -.01em; }
+/* ---------- hero (lab template: CSC tab flush top-left) ---------- */
+.hero { position: relative; }
+.hero .tab { position: absolute; top: 0; left: 0; height: 60px; }
+.hero .wrap { padding-top: 100px; padding-bottom: 36px; }
+.chip { display: inline-block; font-size: 14px; font-weight: 600; padding: 3px 12px; border-radius: 999px;
+  background: var(--accent-soft); color: var(--accent); }
+h1 { font-size: clamp(30px, 5vw, 46px); line-height: 1.12; margin: 14px 0 16px; letter-spacing: -.015em; }
 .authors { font-size: 19px; font-weight: 600; margin: 0; }
-.affil { color: var(--lav); margin: 2px 0 26px; font-size: 16px; }
+.affil { color: var(--muted); margin: 2px 0 24px; font-size: 16px; }
 .btns { display: flex; flex-wrap: wrap; gap: 10px; }
-.btn { display: inline-flex; align-items: center; gap: 8px; text-decoration: none; font-weight: 600;
-  padding: 9px 18px; border-radius: 8px; background: #fff; color: var(--plum); }
-.btn.ghost { background: transparent; color: #fff; box-shadow: inset 0 0 0 1.5px rgba(255,255,255,.5); }
-.btn svg { width: 18px; height: 18px; fill: currentColor; }
+.btn { display: inline-flex; align-items: center; gap: 8px; text-decoration: none; font-weight: 600; font-size: 16px;
+  padding: 8px 16px; border-radius: 8px; color: var(--ink); box-shadow: inset 0 0 0 1px var(--rule); }
+.btn:hover { box-shadow: inset 0 0 0 1px var(--muted); }
+.btn.primary { background: var(--accent); color: var(--on-accent); box-shadow: none; }
+.btn svg, .btn img { width: 18px; height: 18px; fill: currentColor; }
 
-/* ---------- KPI strip ---------- */
-.kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--plum-2);
-  border-radius: 12px; overflow: hidden; margin: -24px 0 0; position: relative; }
-.kpi { background: var(--plum); color: #fff; padding: 18px 14px; text-align: center; }
-.kpi b { display: block; font-size: 34px; line-height: 1.1; }
+/* ---------- headline numbers ---------- */
+.kpis { display: grid; grid-template-columns: repeat(4, 1fr); border-block: 1px solid var(--rule); }
+.kpi { padding: 18px 14px; text-align: center; }
+.kpi + .kpi { border-left: 1px solid var(--rule); }
+.kpi b { display: block; font-size: 32px; line-height: 1.15; color: var(--accent); letter-spacing: -.01em; }
 .kpi span { display: block; font-weight: 600; font-size: 15px; }
-.kpi small { display: block; color: var(--lav); font-size: 13px; line-height: 1.35; margin-top: 4px; }
+.kpi small { display: block; color: var(--muted); font-size: 13px; line-height: 1.35; margin-top: 3px; }
 
 /* ---------- sections ---------- */
-section { padding: 44px 0 0; }
-h2 { color: var(--head); font-size: 28px; margin: 0 0 6px; letter-spacing: -.01em; }
-h3 { color: var(--head); font-size: 20px; margin: 30px 0 6px; }
+section { padding: 48px 0 0; }
+h2 { font-size: 27px; margin: 0 0 6px; letter-spacing: -.01em; }
+h3 { font-size: 19px; margin: 30px 0 6px; }
 .lede { color: var(--muted); margin: 0 0 18px; max-width: 70ch; }
 p { max-width: 75ch; }
-.card { background: var(--card); border-radius: 12px; padding: 20px; }
+.card { border: 1px solid var(--rule); border-radius: 12px; padding: 14px 18px; }
 figure { margin: 18px 0; }
-figure .plate { background: #fff; border-radius: 12px; padding: 16px; text-align: center; }
+figure .plate { background: #fff; border: 1px solid var(--rule); border-radius: 12px; padding: 16px; }
 figure img { display: block; margin: 0 auto; width: 100%; height: auto; }
 figure img.narrow { max-width: 640px; }
 .nw { white-space: nowrap; }
 figcaption { color: var(--muted); font-size: 14.5px; margin-top: 8px; max-width: 80ch; }
-.two { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start; }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; align-items: start; }
 ul.tight { padding-left: 20px; margin: 8px 0; }
 ul.tight li { margin: 4px 0; }
+.site1 { color: var(--bad); } .site2 { color: var(--good); } .site3 { color: var(--salty); }
 
 /* ---------- audio ---------- */
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; }
-.clip { background: var(--card); border-radius: 12px; padding: 14px 14px 12px; border-top: 4px solid var(--rule); }
-.clip h4 { margin: 0; font-size: 16px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+.clip { background: var(--surface); border: 1px solid transparent; border-radius: 12px; padding: 14px 14px 12px; }
+.clip h4 { margin: 0; font-size: 16px; display: flex; align-items: center; gap: 8px; }
+.clip.sweet h4::before, .clip.sour h4::before, .clip.bitter h4::before {
+  content: ""; width: 10px; height: 10px; border-radius: 50%; flex: none; background: var(--dot); }
+.clip.sweet { --dot: var(--sweet); } .clip.sour { --dot: var(--sour); } .clip.bitter { --dot: var(--bitter); }
 .clip .meta { color: var(--muted); font-size: 13.5px; margin: 2px 0 10px; min-height: 1.4em; }
 .clip audio { width: 100%; height: 36px; }
-.clip.sweet { border-top-color: var(--sweet); } .clip.sweet h4 { color: var(--sweet); }
-.clip.sour { border-top-color: var(--sour); } .clip.sour h4 { color: var(--sour); }
-.clip.bitter { border-top-color: var(--bitter); } .clip.bitter h4 { color: var(--bitter); }
-.clip.base { border-top-color: var(--plum-2); }
-.clip.over { opacity: .92; background: repeating-linear-gradient(-45deg, var(--card) 0 10px, var(--bg) 10px 20px); }
+.clip.over { background: transparent; border: 1px dashed var(--rule); }
 .note { font-size: 14.5px; color: var(--muted); margin-top: 12px; }
 .delta { font-variant-numeric: tabular-nums; font-weight: 600; }
 .up { color: var(--good); } .down { color: var(--bad); }
@@ -89,39 +89,41 @@ ul.tight li { margin: 4px 0; }
 .scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 15.5px; }
 th, td { padding: 7px 10px; text-align: right; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+tbody tr:last-child td { border-bottom: 0; }
 th:first-child, td:first-child { text-align: left; }
 th[colspan] { text-align: center; }
 thead th { color: var(--muted); font-weight: 600; font-size: 14px; }
-tr.ours td { font-weight: 700; } tr.ours td:first-child { color: var(--head); }
+tr.ours td { font-weight: 700; }
 tr.ref td { color: var(--muted); }
 td.ok { color: var(--good); font-weight: 600; } td.no { color: var(--bad); font-weight: 600; }
 
 /* ---------- code ---------- */
-pre { background: var(--code-bg); border: 1px solid var(--rule); border-radius: 10px; padding: 14px 16px;
-  overflow-x: auto; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 10px 0; }
+pre { background: var(--surface); border-radius: 10px; padding: 14px 16px; overflow-x: auto;
+  font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 10px 0; }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .92em; }
 .cite { position: relative; }
 .cite button { position: absolute; top: 10px; right: 10px; font: 600 13px system-ui, sans-serif; cursor: pointer;
-  border: 1px solid var(--rule); background: var(--card); color: var(--ink); border-radius: 6px; padding: 4px 10px; }
+  border: 1px solid var(--rule); background: var(--bg); color: var(--ink); border-radius: 6px; padding: 4px 10px; }
 
-/* ---------- footer ---------- */
-.funding { background: #fff; margin-top: 56px; padding: 22px 0; }
-.funding .wrap { display: flex; flex-wrap: wrap; align-items: center; gap: 18px 30px; }
-.funding img { height: 44px; width: auto; }
-.funding img.sf { height: 56px; }
-.funding p { color: #6B6478; font-size: 13.5px; margin: 0; flex: 1 1 240px; }
-footer { background: var(--plum); color: var(--lav); position: relative; min-height: 120px; font-size: 14px; }
-footer .wrap { padding-top: 22px; padding-bottom: 22px; padding-right: 260px; }
-footer a { color: #fff; }
-footer .tab { position: absolute; right: 0; bottom: 0; height: 84px; }
+/* ---------- footer (UniPD/DEI tab flush bottom-right) ---------- */
+footer { position: relative; margin-top: 64px; border-top: 1px solid var(--rule); font-size: 14px; color: var(--muted); }
+footer .wrap { padding-top: 24px; padding-bottom: 28px; padding-right: 240px; }
+.logos { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 14px 28px; background: #fff;
+  border-radius: 10px; padding: 10px 14px; margin-bottom: 14px; }
+.logos img { height: 40px; width: auto; }
+.logos img.sf { height: 52px; }
+footer p { margin: 0; }
+footer .tab { position: absolute; right: 0; bottom: 0; height: 80px; }
 
 @media (max-width: 760px) {
   .kpis { grid-template-columns: repeat(2, 1fr); }
+  .kpi:nth-child(3) { border-left: 0; }
+  .kpi:nth-child(n+3) { border-top: 1px solid var(--rule); }
   .two { grid-template-columns: 1fr; }
-  .hero .tab { height: 48px; }
-  .hero .wrap { padding-top: 80px; }
-  footer .wrap { padding-right: 16px; padding-bottom: 96px; }
-  footer .tab { height: 64px; }
+  .hero .tab { height: 46px; }
+  .hero .wrap { padding-top: 76px; }
+  footer .wrap { padding-right: 16px; padding-bottom: 92px; }
+  footer .tab { height: 60px; }
 }
 </style>
 </head>
@@ -135,11 +137,12 @@ footer .tab { position: absolute; right: 0; bottom: 0; height: 84px; }
     <p class="authors">Matteo Spanio &nbsp;·&nbsp; Antonio Rodà</p>
     <p class="affil">Centro di Sonologia Computazionale (CSC), Dept. of Information Engineering, University of Padova</p>
     <div class="btns">
-      <a class="btn" href="https://arxiv.org/abs/2607.08526">
+      <a class="btn primary" href="https://arxiv.org/abs/2607.08526">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 2h9l5 5v15H6V2zm8 1.5V8h4.5L14 3.5zM8 12h10v1.5H8V12zm0 3h10v1.5H8V15zm0 3h7v1.5H8V18z"/></svg>Paper</a>
-      <a class="btn ghost" href="https://github.com/matteospanio/aria">
+      <a class="btn" href="https://github.com/matteospanio/aria">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .5a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.53-1.33-1.28-1.69-1.28-1.69-1.05-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.8 1.19 1.83 1.19 3.09 0 4.42-2.69 5.39-5.26 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .5z"/></svg>Code</a>
-      <a class="btn ghost" href="#cite">Cite</a>
+      <a class="btn" href="https://huggingface.co/matteospanio/aria"><img src="img/hf-logo.png" alt="">Steering vectors</a>
+      <a class="btn" href="#cite">Cite</a>
     </div>
   </div>
 </header>
@@ -163,8 +166,8 @@ footer .tab { position: absolute; right: 0; bottom: 0; height: 84px; }
       <div class="plate"><img class="narrow" src="img/overview.svg" alt="Diagram: the same Stable Audio 3 checkpoints move from a framework-bound PyTorch stack (11.6–22.2 s cold start, out of memory at load on 8 GB, 15–48 s compile per clip length) to a single aria binary (1.6–2.9 s cold start, 0.13 s warm, both models on a Raspberry Pi 5). Steering can be injected at the DiT residual stream, the latent, or the text conditioning."></div>
       <figcaption>Same checkpoints, moved from a framework-bound serving stack to one binary on hardware people
       own. Because the runtime owns every tensor, activation steering becomes a built-in feature, injected
-      at <span style="color:var(--bad)">①</span> the DiT residual stream, <span style="color:var(--good)">②</span>
-      the latent, or <span style="color:var(--salty)">③</span> the text conditioning.</figcaption>
+      at <span class="site1">①</span> the DiT residual stream, <span class="site2">②</span>
+      the latent, or <span class="site3">③</span> the text conditioning.</figcaption>
     </figure>
     <ul class="tight">
       <li><strong>No framework underneath.</strong> No BLAS, no deep-learning library: a C math library and a threading runtime.</li>
@@ -211,8 +214,8 @@ footer .tab { position: absolute; right: 0; bottom: 0; height: 84px; }
 
     <h3>Sonic seasoning: steering one clip toward a taste</h3>
     <p>Music shifts perceived taste: consonant, high-pitched legato reads as sweet, dissonant low music as
-    bitter. aria adds a taste direction (difference-in-means over 377 human-rated clips) to one transformer
-    block while generating. Prompt <em>“lo-fi hip hop beat”</em>, seed 22, same noise in every clip.
+    bitter. aria adds a taste direction (difference-in-means over 377 human-rated clips,
+    <a href="https://huggingface.co/matteospanio/aria">on Hugging Face</a>) to one transformer block while generating. Prompt <em>“lo-fi hip hop beat”</em>, seed 22, same noise in every clip.
     Δ is the change in the wav2taste score against the unsteered clip.</p>
     <div class="grid">
       <div class="clip base"><h4>unsteered</h4><div class="meta">α = 0</div>
@@ -335,7 +338,11 @@ make                                   # CPU build (make cuda CUDA_ARCH=sm_86 fo
 python scripts/export_tokenizer.py models/small-music
 
 ./aria -m models/small-music -p "warm romantic piano, slow, tender" -d 15 -s 8 --seed 0 -o out.wav
-./aria -m models/small-music -p "..." --precision q4 -o out.wav      # 4-bit DiT</code></pre>
+./aria -m models/small-music -p "..." --precision q4 -o out.wav      # 4-bit DiT
+
+hf download matteospanio/aria --local-dir directions               # taste-steering vectors
+./aria -m models/small-music -p "lo-fi hip hop beat" --seed 22 -o sour.wav \
+       --steer residual:19:directions/small/sour.atns:0.1:0-7</code></pre>
   </section>
 
   <section id="cite">
@@ -355,20 +362,17 @@ python scripts/export_tokenizer.py models/small-music
   </section>
 </main>
 
-<div class="funding">
-  <div class="wrap">
-    <img src="img/eu-nextgenerationeu.png" alt="Funded by the European Union – NextGenerationEU">
-    <img src="img/italiadomani.png" alt="Italiadomani – Piano Nazionale di Ripresa e Resilienza">
-    <img src="img/mur.png" alt="Ministero dell'Università e della Ricerca">
-    <img class="sf" src="img/logo-sf-ink.png" alt="SoundFood – The Music Sommelier">
-    <p>Funded by the European Union – NextGenerationEU, under the National Recovery and Resilience Plan (PNRR).</p>
-  </div>
-</div>
 <footer>
   <div class="wrap">
-    Code under the MIT license; Stable Audio 3 weights under the
+    <div class="logos">
+      <img src="img/eu-nextgenerationeu.png" alt="Funded by the European Union – NextGenerationEU">
+      <img src="img/italiadomani.png" alt="Italiadomani – Piano Nazionale di Ripresa e Resilienza">
+      <img src="img/mur.png" alt="Ministero dell'Università e della Ricerca">
+      <img class="sf" src="img/logo-sf-ink.png" alt="SoundFood – The Music Sommelier">
+    </div>
+    <p>Code under the MIT license; Stable Audio 3 weights under the
     <a href="https://stability.ai/license">Stability AI Community License</a>.
-    Built on <a href="https://github.com/Stability-AI/stable-audio-tools">stable-audio-tools</a>.
+    Built on <a href="https://github.com/Stability-AI/stable-audio-tools">stable-audio-tools</a>.</p>
   </div>
   <img class="tab" src="img/tab_br_unipd_dei.png" alt="Università degli Studi di Padova – Dipartimento di Ingegneria dell'Informazione">
 </footer>

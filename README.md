@@ -2,6 +2,8 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2607.08526-b31b1b?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2607.08526)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Demo](https://img.shields.io/badge/demo-audio%20examples-33224A)](https://matteospanio.github.io/aria/)
+[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-steering%20vectors-ffd21e)](https://huggingface.co/matteospanio/aria)
 
 aria is a native inference engine for audio diffusion models, written from scratch in C with no third-party dependencies. It runs Stable Audio 3 (small-music and medium) end to end, from a text prompt to a stereo WAV, with no Python or deep-learning framework underneath.
 
@@ -105,6 +107,16 @@ make quantize && ./aria-quantize models/small-music dit.q4.aria q4
 ## Steering
 
 Steering directions are plain tensor files, applied as `x += scale * direction` at a chosen boundary — the 256-D diffusion latent, a per-layer DiT residual (1024-D), the conditioning vectors (768-D), or the pre-decode latent. The `--steer site:layer:dir.atns:scale:lo-hi` flag drives it, and the parity harness doubles as the path for extracting the directions. The paper's "sonic seasoning" case study uses this interface to bias generations toward taste associations.
+
+The taste directions from the paper (small-music and medium, plus the latent and conditioning sites) are on
+[Hugging Face](https://huggingface.co/matteospanio/aria), with the operating points that held up under the
+paper's quality checks. Listen to the results on the [demo page](https://matteospanio.github.io/aria/).
+
+```sh
+hf download matteospanio/aria --local-dir directions
+./aria -m models/small-music -p "lo-fi hip hop beat" --seed 22 -o sour.wav \
+       --steer residual:19:directions/small/sour.atns:0.1:0-7
+```
 
 ## Parity and testing
 
