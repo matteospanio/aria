@@ -218,10 +218,19 @@ static float *sa3_build_inpaint_local(aria_ctx *ctx, sa3_state *st,
     /* the SAME encoder rounds T_patch up to a multiple of 32 -> its latent length is
      * ceil(T/2)*2 (= T for even T, T+1 for odd T), which can exceed the DiT's T; size the
      * buffer to the encoder's actual output so the write fits, then use the first T. */
+    /* SAME-S rounds T_patch up to a multiple of 32, so for an odd T its latent has T+1
+     * frames ([256,T+1], channel-major): keep each channel's first T frames. (Reading it
+     * as [256,T] shifted channel c by c frames -- every small-model stream chunk, a
+     * 12.5 s window = 135 frames, was conditioned on a scrambled context.) */
     int T_enc = aria_sa3_enc_latent_len(st->enc_taae, aria_sa3_patch_len(audio_len));
-    float *latent = malloc((size_t)256 * (T_enc > T ? T_enc : T) * sizeof(float));
-    aria_sa3_enc_forward(st->enc_taae, latent, audio, audio_len);
+    float *enc_lat = malloc((size_t)256 * T_enc * sizeof(float));
+    aria_sa3_enc_forward(st->enc_taae, enc_lat, audio, audio_len);
     free(audio);
+    float *latent = calloc((size_t)256 * T, sizeof(float));
+    int nk = T_enc < T ? T_enc : T;
+    for (int c = 0; c < 256; c++)
+        memcpy(latent + (size_t)c * T, enc_lat + (size_t)c * T_enc, (size_t)nk * sizeof(float));
+    free(enc_lat);
 
     /* keep/regenerate mask (1=keep, 0=regenerate). continue: regenerate the tail. */
     float from_s = p->inpaint_continue ? (float)clip / st->sample_rate : p->inpaint_from_s;
