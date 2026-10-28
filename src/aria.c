@@ -10,7 +10,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
-#include <unistd.h>
+#ifndef _WIN32
+#include <unistd.h>   /* sysconf (aria_win_compat.h shims it on Windows) */
+#endif
 #ifdef _OPENMP
 #include <omp.h>
 #endif

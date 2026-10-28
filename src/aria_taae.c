@@ -5,6 +5,7 @@
  */
 
 #include "aria_taae.h"
+#include "aria_win_compat.h"
 #include "aria_ops.h"
 #ifdef _OPENMP
 #include <omp.h>
@@ -12,8 +13,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <sys/mman.h>   /* B3: release the fp32 mmap source after the overlay copies it */
+#ifndef _WIN32
+#include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 /* ---- B3: opt-in q8/fp16 decoder-weight overlay ----
  * Dispatch one GEMM through the overlay (q8 sdot/AVX2 or fp16 widening) when the

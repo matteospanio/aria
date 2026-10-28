@@ -5,6 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 #define HP_N    2048      /* FFT size (~46 ms @ 44.1k) */
 #define HP_HOP  512       /* 75% overlap */

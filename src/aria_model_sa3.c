@@ -23,11 +23,24 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+#ifndef _WIN32
 #include <sys/resource.h>
 #include <unistd.h>
+#endif
 
 /* optional per-stage timing + memory (set ARIA_PROFILE=1) */
-static double sa3_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
+static double sa3_now(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER f; static int init; LARGE_INTEGER q;
+    if (!init) { QueryPerformanceFrequency(&f); init = 1; }
+    QueryPerformanceCounter(&q); return (double)q.QuadPart / (double)f.QuadPart;
+#else
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9;
+#endif
+}
 
 typedef struct {
     aria_sa3_config cfg;
@@ -616,13 +629,19 @@ static int sa3_generate(aria_ctx *ctx, void *state,
 #endif
     double t3 = sa3_now();
     if (profile) {
+        double peak_rss = 0;
+#ifndef _WIN32
         struct rusage ru; getrusage(RUSAGE_SELF, &ru);
-        double cur_rss = 0;   /* current resident set (post host-weight drop on GPU) */
+        peak_rss = ru.ru_maxrss / 1024.0;
+#endif
+        double cur_rss = 0;
+#ifndef _WIN32
         FILE *sf = fopen("/proc/self/statm", "r");
         if (sf) { long sz = 0, res = 0; if (fscanf(sf, "%ld %ld", &sz, &res) == 2) cur_rss = res * 4096.0 / 1048576.0; fclose(sf); }
+#endif
         static const char *sched_names[] = {"default", "ref", "len", "full"};
         fprintf(stderr, "[aria] profile: prompt=%.2fs weights=%.2fs setup=%.2fs dit=%.2fs decode=%.2fs (T=%d steps=%d sched=%s) | RSS cur %.0f / peak %.0f MB",
-                t_prompt, t_gpu_init, t1 - t0, t2 - t1, t3 - t2, T, steps, sched_names[sk], cur_rss, ru.ru_maxrss / 1024.0);
+                t_prompt, t_gpu_init, t1 - t0, t2 - t1, t3 - t2, T, steps, sched_names[sk], cur_rss, peak_rss);
 #ifdef ARIA_CUDA
         if (st->cdit || st->cdec || st->cdec_med) {
             size_t used = 0, total = 0; aria_cuda_meminfo(&used, &total);

@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aria: on-device semantic audio generation</title>
+<meta name="description" content="aria is a dependency-free C/CUDA runtime that runs Stable Audio 3 on GPUs, CPU-only machines and a Raspberry Pi 5, with 8-bit quantization at no measurable quality cost and built-in activation steering. IEEE IS2 2026.">
+<style>
+:root {
+  --bg: #FFFFFF; --surface: #F6F6F4; --ink: #18181B; --muted: #64646C; --rule: #E5E5E2;
+  --accent: #33224A; --accent-soft: #EFECF4; --on-accent: #FFFFFF;
+  --sweet: #D55E00; --sour: #009E73; --bitter: #6B6B6B; --salty: #0072B2; --spicy: #E69F00;
+  --good: #00835F; --bad: #C24F00;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111113; --surface: #1B1B1E; --ink: #EDEDEF; --muted: #9D9DA6; --rule: #2B2B30;
+    --accent: #BBA8E2; --accent-soft: #24202D; --on-accent: #16121D;
+    --bitter: #A6A6A6; --good: #3CC59A; --bad: #F08A3E;
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 17px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, "Source Sans 3", "Helvetica Neue", Arial, sans-serif;
+}
+a { color: var(--accent); text-underline-offset: 2px; }
+img, svg { max-width: 100%; }
+.wrap { max-width: 1000px; margin: 0 auto; padding: 0 16px; }
+
+/* ---------- hero (lab template: CSC tab flush top-left) ---------- */
+.hero { position: relative; }
+.hero .tab { position: absolute; top: 0; left: 0; height: 60px; }
+.hero .wrap { padding-top: 100px; padding-bottom: 36px; }
+.chip { display: inline-block; font-size: 14px; font-weight: 600; padding: 3px 12px; border-radius: 999px;
+  background: var(--accent-soft); color: var(--accent); }
+h1 { font-size: clamp(30px, 5vw, 46px); line-height: 1.12; margin: 14px 0 16px; letter-spacing: -.015em; }
+.authors { font-size: 19px; font-weight: 600; margin: 0; }
+.affil { color: var(--muted); margin: 2px 0 24px; font-size: 16px; }
+.btns { display: flex; flex-wrap: wrap; gap: 10px; }
+.btn { display: inline-flex; align-items: center; gap: 8px; text-decoration: none; font-weight: 600; font-size: 16px;
+  padding: 8px 16px; border-radius: 8px; color: var(--ink); box-shadow: inset 0 0 0 1px var(--rule); }
+.btn:hover { box-shadow: inset 0 0 0 1px var(--muted); }
+.btn.primary { background: var(--accent); color: var(--on-accent); box-shadow: none; }
+.btn svg, .btn img { width: 18px; height: 18px; fill: currentColor; }
+
+/* ---------- headline numbers ---------- */
+.kpis { display: grid; grid-template-columns: repeat(4, 1fr); border-block: 1px solid var(--rule); }
+.kpi { padding: 18px 14px; text-align: center; }
+.kpi + .kpi { border-left: 1px solid var(--rule); }
+.kpi b { display: block; font-size: 32px; line-height: 1.15; color: var(--accent); letter-spacing: -.01em; }
+.kpi span { display: block; font-weight: 600; font-size: 15px; }
+.kpi small { display: block; color: var(--muted); font-size: 13px; line-height: 1.35; margin-top: 3px; }
+
+/* ---------- sections ---------- */
+section { padding: 48px 0 0; }
+h2 { font-size: 27px; margin: 0 0 6px; letter-spacing: -.01em; }
+h3 { font-size: 19px; margin: 30px 0 6px; }
+.lede { color: var(--muted); margin: 0 0 18px; max-width: 70ch; }
+p { max-width: 75ch; }
+.card { border: 1px solid var(--rule); border-radius: 12px; padding: 14px 18px; }
+figure { margin: 18px 0; }
+figure .plate { background: #fff; border: 1px solid var(--rule); border-radius: 12px; padding: 16px; }
+figure img { display: block; margin: 0 auto; width: 100%; height: auto; }
+figure img.narrow { max-width: 640px; }
+.nw { white-space: nowrap; }
+figcaption { color: var(--muted); font-size: 14.5px; margin-top: 8px; max-width: 80ch; }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; align-items: start; }
+ul.tight { padding-left: 20px; margin: 8px 0; }
+ul.tight li { margin: 4px 0; }
+.site1 { color: var(--bad); } .site2 { color: var(--good); } .site3 { color: var(--salty); }
+
+/* ---------- audio ---------- */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+.clip { background: var(--surface); border: 1px solid transparent; border-radius: 12px; padding: 14px 14px 12px; }
+.clip h4 { margin: 0; font-size: 16px; display: flex; align-items: center; gap: 8px; }
+.clip.sweet h4::before, .clip.sour h4::before, .clip.bitter h4::before {
+  content: ""; width: 10px; height: 10px; border-radius: 50%; flex: none; background: var(--dot); }
+.clip.sweet { --dot: var(--sweet); } .clip.sour { --dot: var(--sour); } .clip.bitter { --dot: var(--bitter); }
+.clip .meta { color: var(--muted); font-size: 13.5px; margin: 2px 0 10px; min-height: 1.4em; }
+.clip audio { width: 100%; height: 36px; }
+.clip.over { background: transparent; border: 1px dashed var(--rule); }
+.note { font-size: 14.5px; color: var(--muted); margin-top: 12px; }
+.delta { font-variant-numeric: tabular-nums; font-weight: 600; }
+.up { color: var(--good); } .down { color: var(--bad); }
+
+/* ---------- tables ---------- */
+.scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 15.5px; }
+th, td { padding: 7px 10px; text-align: right; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+tbody tr:last-child td { border-bottom: 0; }
+th:first-child, td:first-child { text-align: left; }
+th[colspan] { text-align: center; }
+thead th { color: var(--muted); font-weight: 600; font-size: 14px; }
+tr.ours td { font-weight: 700; }
+tr.ref td { color: var(--muted); }
+td.ok { color: var(--good); font-weight: 600; } td.no { color: var(--bad); font-weight: 600; }
+
+/* ---------- code ---------- */
+pre { background: var(--surface); border-radius: 10px; padding: 14px 16px; overflow-x: auto;
+  font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 10px 0; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .92em; }
+.cite { position: relative; }
+.cite button { position: absolute; top: 10px; right: 10px; font: 600 13px system-ui, sans-serif; cursor: pointer;
+  border: 1px solid var(--rule); background: var(--bg); color: var(--ink); border-radius: 6px; padding: 4px 10px; }
+
+/* ---------- footer (UniPD/DEI tab flush bottom-right) ---------- */
+footer { position: relative; margin-top: 64px; border-top: 1px solid var(--rule); font-size: 14px; color: var(--muted); }
+footer .wrap { padding-top: 24px; padding-bottom: 28px; padding-right: 240px; }
+.logos { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 14px 28px; background: #fff;
+  border-radius: 10px; padding: 10px 14px; margin-bottom: 14px; }
+.logos img { height: 40px; width: auto; }
+.logos img.sf { height: 52px; }
+footer p { margin: 0; }
+footer .tab { position: absolute; right: 0; bottom: 0; height: 80px; }
+
+@media (max-width: 760px) {
+  .kpis { grid-template-columns: repeat(2, 1fr); }
+  .kpi:nth-child(3) { border-left: 0; }
+  .kpi:nth-child(n+3) { border-top: 1px solid var(--rule); }
+  .two { grid-template-columns: 1fr; }
+  .hero .tab { height: 46px; }
+  .hero .wrap { padding-top: 76px; }
+  footer .wrap { padding-right: 16px; padding-bottom: 92px; }
+  footer .tab { height: 60px; }
+}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <img class="tab" src="img/tab_tl_csc.png" alt="Centro di Sonologia Computazionale">
+  <div class="wrap">
+    <span class="chip">IEEE IS2 2026 · Cannes, France</span>
+    <h1>A Quantized Native Runtime for <span class="nw">On-Device</span> Semantic Audio Generation</h1>
+    <p class="authors">Matteo Spanio &nbsp;·&nbsp; Antonio Rodà</p>
+    <p class="affil">Centro di Sonologia Computazionale (CSC), Dept. of Information Engineering, University of Padova</p>
+    <div class="btns">
+      <a class="btn primary" href="https://arxiv.org/abs/2607.08526">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 2h9l5 5v15H6V2zm8 1.5V8h4.5L14 3.5zM8 12h10v1.5H8V12zm0 3h10v1.5H8V15zm0 3h7v1.5H8V18z"/></svg>Paper</a>
+      <a class="btn" href="https://github.com/matteospanio/aria">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .5a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.53-1.33-1.28-1.69-1.28-1.69-1.05-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.8 1.19 1.83 1.19 3.09 0 4.42-2.69 5.39-5.26 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .5z"/></svg>Code</a>
+      <a class="btn" href="https://huggingface.co/matteospanio/aria"><img src="img/hf-logo.png" alt="">Steering vectors</a>
+      <a class="btn" href="#cite">Cite</a>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="kpis">
+    <div class="kpi"><b>7×</b><span>faster cold start</span><small>1.6 s vs 11.6 s, same checkpoints</small></div>
+    <div class="kpi"><b>0.13 s</b><span>per 10 s clip, warm</span><small>RTX 3070; official stack 0.146 s</small></div>
+    <div class="kpi"><b>2.3×</b><span>less Pi memory at 8-bit</span><small>1.9 → 0.84 GB, within re-seed noise</small></div>
+    <div class="kpi"><b>1.2 B</b><span>params on a Raspberry Pi 5</span><small>medium model, 4-bit, 8 GB board</small></div>
+  </div>
+
+  <section id="about">
+    <h2>What aria is</h2>
+    <p>Open-weight music models are now good enough for interactive tools and edge devices, but their
+    reference implementations assume a Python/PyTorch stack and a discrete GPU. <strong>aria</strong> is a
+    dependency-free runtime in about 7.7k lines of C and CUDA that runs the complete Stable Audio 3
+    text-to-music pipeline (tokenizer, T5Gemma text encoder, diffusion transformer, autoencoder) on
+    ordinary GPUs, CPU-only machines and a Raspberry Pi 5.</p>
+    <figure>
+      <div class="plate"><img class="narrow" src="img/overview.svg" alt="Diagram: the same Stable Audio 3 checkpoints move from a framework-bound PyTorch stack (11.6–22.2 s cold start, out of memory at load on 8 GB, 15–48 s compile per clip length) to a single aria binary (1.6–2.9 s cold start, 0.13 s warm, both models on a Raspberry Pi 5). Steering can be injected at the DiT residual stream, the latent, or the text conditioning."></div>
+      <figcaption>Same checkpoints, moved from a framework-bound serving stack to one binary on hardware people
+      own. Because the runtime owns every tensor, activation steering becomes a built-in feature, injected
+      at <span class="site1">①</span> the DiT residual stream, <span class="site2">②</span>
+      the latent, or <span class="site3">③</span> the text conditioning.</figcaption>
+    </figure>
+    <ul class="tight">
+      <li><strong>No framework underneath.</strong> No BLAS, no deep-learning library: a C math library and a threading runtime.</li>
+      <li><strong>Two backends, one op surface.</strong> Vectorized multi-threaded CPU path with 8-bit integer matmul (x86 and ARM);
+        CUDA path with fp16 tensor cores and the denoising loop replayed as one CUDA graph.</li>
+      <li><strong>Quantization that saves memory.</strong> Weights from fp16 down to 8- or 4-bit; the full-precision copy is released
+        once packed, so a lower precision replaces the footprint instead of adding to it.</li>
+      <li><strong>Long-form and serving.</strong> Windowed and streaming decoders with byte-identical output; a resident batch mode and an
+        HTTP server keep the model loaded (0.60 s per job vs 1.23 s per invocation).</li>
+    </ul>
+  </section>
+
+  <section id="listen">
+    <h2>Listen</h2>
+    <p class="lede">Every clip on this page was generated by aria from the Stable Audio 3 <em>small-music</em>
+    checkpoint (8 steps, 10 s unless noted) and loudness-normalized as in the paper's evaluation.</p>
+
+    <h3>Text to music</h3>
+    <div class="grid">
+      <div class="clip base"><h4>solo piano piece</h4><div class="meta">seed 11</div>
+        <audio controls preload="none" src="audio/p0_s11_base.mp3"></audio></div>
+      <div class="clip base"><h4>orchestral film score cue</h4><div class="meta">seed 11</div>
+        <audio controls preload="none" src="audio/p5_s11_base.mp3"></audio></div>
+      <div class="clip base"><h4>synthwave track</h4><div class="meta">seed 11</div>
+        <audio controls preload="none" src="audio/p6_s11_base.mp3"></audio></div>
+      <div class="clip base"><h4>bossa nova with nylon guitar</h4><div class="meta">seed 11</div>
+        <audio controls preload="none" src="audio/p9_s11_base.mp3"></audio></div>
+    </div>
+
+    <h3>Precision ladder: same prompt, same seed</h3>
+    <p>The transformer stored at four precisions, everything else fixed (GPU, fp16 decoder). Prompt
+    <em>“blues shuffle with electric guitar”</em>, seed 2, whose 4-bit change in prompt adherence sits near
+    the median of the 72 clips in the study. Memory is the Raspberry Pi 5 peak.</p>
+    <div class="grid">
+      <div class="clip base"><h4>fp16</h4><div class="meta">reference · 1198 MB</div>
+        <audio controls preload="none" src="audio/quant_fp16.mp3"></audio></div>
+      <div class="clip base"><h4>q8</h4><div class="meta">8-bit weights · 836 MB</div>
+        <audio controls preload="none" src="audio/quant_q8.mp3"></audio></div>
+      <div class="clip base"><h4>W8A8</h4><div class="meta">8-bit arithmetic · 836 MB · fastest GPU mode</div>
+        <audio controls preload="none" src="audio/quant_w8a8.mp3"></audio></div>
+      <div class="clip base"><h4>q4</h4><div class="meta">4-bit weights · 776 MB</div>
+        <audio controls preload="none" src="audio/quant_q4.mp3"></audio></div>
+    </div>
+
+    <h3>Sonic seasoning: steering one clip toward a taste</h3>
+    <p>Music shifts perceived taste: consonant, high-pitched legato reads as sweet, dissonant low music as
+    bitter. aria adds a taste direction (difference-in-means over 377 human-rated clips,
+    <a href="https://huggingface.co/matteospanio/aria">on Hugging Face</a>) to one transformer block while generating. Prompt <em>“lo-fi hip hop beat”</em>, seed 22, same noise in every clip.
+    Δ is the change in the wav2taste score against the unsteered clip.</p>
+    <div class="grid">
+      <div class="clip base"><h4>unsteered</h4><div class="meta">α = 0</div>
+        <audio controls preload="none" src="audio/p7_s22_base.mp3"></audio></div>
+      <div class="clip sweet"><h4>sweet</h4><div class="meta">block 16, α = 0.3 · Δ <span class="delta up">+0.12</span></div>
+        <audio controls preload="none" src="audio/p7_s22_sweet_a0.3.mp3"></audio></div>
+      <div class="clip sour"><h4>sour</h4><div class="meta">block 19, α = 0.1 · Δ <span class="delta up">+0.54</span></div>
+        <audio controls preload="none" src="audio/p7_s22_sour_a0.1.mp3"></audio></div>
+      <div class="clip bitter"><h4>bitter</h4><div class="meta">block 19, α = 0.1 · Δ <span class="delta up">+0.41</span></div>
+        <audio controls preload="none" src="audio/p7_s22_bitter_a0.1.mp3"></audio></div>
+    </div>
+    <p class="note">Not cherry-picked: this prompt and seed sit near the median taste shift on all three axes.
+    Salty and spicy are omitted because they stay weak even inside the clean window.</p>
+
+    <h3>Too far: over-steering</h3>
+    <p>Push the strength to α = 1 and the music falls apart, yet the taste regressor still scores sour and
+    bitter <em>up</em>. This is why aria's operating points are chosen with independent checks (CLAP, FAD),
+    never with the steered metric alone.</p>
+    <div class="grid">
+      <div class="clip sweet over"><h4>sweet, α = 1</h4><div class="meta">Δ <span class="delta down">−0.21</span></div>
+        <audio controls preload="none" src="audio/p7_s22_sweet_a1.mp3"></audio></div>
+      <div class="clip sour over"><h4>sour, α = 1</h4><div class="meta">Δ <span class="delta down">+0.27</span>, but degraded</div>
+        <audio controls preload="none" src="audio/p7_s22_sour_a1.mp3"></audio></div>
+      <div class="clip bitter over"><h4>bitter, α = 1</h4><div class="meta">Δ <span class="delta down">+0.26</span>, but degraded</div>
+        <audio controls preload="none" src="audio/p7_s22_bitter_a1.mp3"></audio></div>
+    </div>
+  </section>
+
+  <section id="results">
+    <h2>Results</h2>
+
+    <h3>Runtime vs. the official PyTorch stack</h3>
+    <div class="card scroll">
+      <table>
+        <thead>
+          <tr><th></th><th colspan="2">small-music</th><th colspan="2">medium</th></tr>
+          <tr><th>10 s clip, 8 steps, steering on</th><th>time (s)</th><th>VRAM (MB)</th><th>time (s)</th><th>VRAM (MB)</th></tr>
+        </thead>
+        <tbody>
+          <tr class="ours"><td>aria GPU, warm</td><td>0.13</td><td>1395</td><td>0.37</td><td>4215</td></tr>
+          <tr class="ref"><td>SA3 GPU, warm</td><td>0.146</td><td>2330</td><td>0.443</td><td>5948</td></tr>
+          <tr class="ours"><td>aria cold start</td><td>1.6</td><td>–</td><td>2.9</td><td>–</td></tr>
+          <tr class="ref"><td>SA3 cold start</td><td>11.58</td><td>–</td><td>22.23</td><td>–</td></tr>
+          <tr class="ours"><td>aria CPU-only (20 threads)</td><td>2.5</td><td>–</td><td>9.8</td><td>–</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">RTX 3070 (8 GB) with an i9-10900KF. Warm = model already resident on both sides; cold = process
+    spawn + weight load + one generation. The official stack's compiler recompiles for each new clip length
+    (14.5–48.1 s), and its medium loader briefly needs ~7.1 GB, overflowing an 8 GB card.</p>
+
+    <h3>Quantization is close to free at 8-bit</h3>
+    <div class="two">
+      <figure>
+        <div class="plate"><img src="img/quant.svg" alt="Scatter of Raspberry Pi peak memory against FAD versus fp16: q8 and W8A8 sit inside the re-seed noise band at about 836 MB; fp16 at 1198 MB; q4 at 776 MB with FAD 126, outside the band."></div>
+        <figcaption>Shaded band: the FAD a mere fp16 re-seed induces. Marker area: taste-vector change.</figcaption>
+      </figure>
+      <div class="card scroll">
+        <table>
+          <thead><tr><th>small-music</th><th>fp16</th><th>q8</th><th>W8A8</th><th>q4</th></tr></thead>
+          <tbody>
+            <tr><td>GPU warm (s)</td><td>0.13</td><td>0.20</td><td class="ok">0.10</td><td>0.22</td></tr>
+            <tr><td>VRAM (MB)</td><td>1510</td><td>1190</td><td>1190</td><td>1128</td></tr>
+            <tr><td>Pi 5 peak (MB)</td><td>1198</td><td>836</td><td>836</td><td>776</td></tr>
+            <tr><td>ΔCLAP (±0.004)</td><td>ref</td><td class="ok">+0.002</td><td class="ok">−0.001</td><td class="no">−0.020</td></tr>
+            <tr><td>FAD (44.0)</td><td>ref</td><td class="ok">18.6</td><td class="ok">17.7</td><td class="no">125.8</td></tr>
+            <tr><td>Δtaste (0.153)</td><td>ref</td><td class="ok">0.035</td><td class="ok">0.044</td><td class="no">0.199</td></tr>
+          </tbody>
+        </table>
+        <p class="note">In brackets: the re-seed noise floor of each check. 8-bit stays inside all three;
+        W8A8 (8-bit arithmetic on integer tensor cores) is the fastest GPU mode. 4-bit crosses every floor,
+        but it is what puts the 1.2 B medium model on an 8 GB Pi (~200 s; 0.9 GB resident).</p>
+      </div>
+    </div>
+
+    <h3>Steering is real, inside a narrow window</h3>
+    <div class="two">
+      <figure>
+        <div class="plate"><img src="img/degradation.svg" alt="Three stacked panels against steering strength alpha for sour at block 19: the wav2taste target peaks at alpha 0.15 and stays high; CLAP is positive only at alpha 0.1 then drops to about minus 5; FAD rises from 561 to over 1000."></div>
+        <figcaption>Sour, block 19. Target and CLAP rise together only at α = 0.1; past it the target keeps
+        climbing while CLAP collapses and FAD explodes.</figcaption>
+      </figure>
+      <div>
+        <p>A learned taste regressor is the steering target, so it can be gamed. Every operating point is gated by
+        three independent oracles: CLAP similarity to a taste prompt, FAD, and audio drift.</p>
+        <ul class="tight">
+          <li><strong>Genuine control</strong> for sweet, sour and bitter, confirmed by CLAP and replicated on ten held-out prompts
+            (sour: Δ +0.42, p = 2.9×10⁻¹¹).</li>
+          <li><strong>The metric's maximum lies inside the degradation regime.</strong> A layer scan ranked by the target alone picks the
+            final block for the intense tastes; the oracle panel rejects it as degradation.</li>
+          <li><strong>Steering beats a trained LoRA</strong> under the same panel: no training, a 4–6 KB vector instead of 10.4 MB per
+            axis, no inference overhead, and removable at α = 0 with bit-identical output.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h3>Live steering while streaming</h3>
+    <div class="two">
+      <figure>
+        <div class="plate"><img src="img/ramp.svg" alt="Steering scale alpha stepped from 0 up to 0.5 and back to 0 across 12 stream chunks; the sweet score rises from 0.29 to about 0.5 and falls back to 0.18 with a lag."></div>
+      </figure>
+      <div>
+        <p>The model stays warm and steering lives inside the captured graph, so control can change mid-stream.
+        Ramping sweet 0 → 0.5 → 0 across a 12-chunk stream, the per-chunk taste score tracks the schedule
+        (Spearman ρ = 0.78, p = 0.003), lagging on the way down as each continuation inherits context.
+        On the Raspberry Pi 5 a steered clip costs the same as an unsteered one (32.9 vs 32.8 s).</p>
+        <div class="clip sweet"><h4>the stream in the plot</h4><div class="meta">sweet ramped 0 → 0.5 → 0 · 28 s</div>
+          <audio controls preload="none" src="audio/ramp_demo.mp3"></audio></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="run">
+    <h2>Run it</h2>
+    <p class="lede">Linux: a C11 compiler, <code>make</code>, libm and OpenMP. Windows: <code>build.bat</code> with MSVC.
+    CUDA is optional. Full instructions in the <a href="https://github.com/matteospanio/aria#readme">README</a>.</p>
+<pre><code>git clone https://github.com/matteospanio/aria && cd aria
+make                                   # CPU build (make cuda CUDA_ARCH=sm_86 for NVIDIA)
+./download_model.sh small-music        # gated on Hugging Face: accept the license first
+python scripts/export_tokenizer.py models/small-music
+
+./aria -m models/small-music -p "warm romantic piano, slow, tender" -d 15 -s 8 --seed 0 -o out.wav
+./aria -m models/small-music -p "..." --precision q4 -o out.wav      # 4-bit DiT
+
+hf download matteospanio/aria --local-dir directions               # taste-steering vectors
+./aria -m models/small-music -p "lo-fi hip hop beat" --seed 22 -o sour.wav \
+       --steer residual:19:directions/small/sour.atns:0.1:0-7</code></pre>
+  </section>
+
+  <section id="cite">
+    <h2>Cite</h2>
+    <div class="cite">
+      <button type="button" id="copy">Copy</button>
+<pre id="bib"><code>@misc{spanio2026quantizednativeruntimeondevice,
+  title         = {A Quantized Native Runtime for On-Device Semantic Audio Generation},
+  author        = {Matteo Spanio and Antonio Rodà},
+  year          = {2026},
+  eprint        = {2607.08526},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.SD},
+  url           = {https://arxiv.org/abs/2607.08526},
+}</code></pre>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="logos">
+      <img src="img/eu-nextgenerationeu.png" alt="Funded by the European Union – NextGenerationEU">
+      <img src="img/italiadomani.png" alt="Italiadomani – Piano Nazionale di Ripresa e Resilienza">
+      <img src="img/mur.png" alt="Ministero dell'Università e della Ricerca">
+      <img class="sf" src="img/logo-sf-ink.png" alt="SoundFood – The Music Sommelier">
+    </div>
+    <p>Code under the MIT license; Stable Audio 3 weights under the
+    <a href="https://stability.ai/license">Stability AI Community License</a>.
+    Built on <a href="https://github.com/Stability-AI/stable-audio-tools">stable-audio-tools</a>.</p>
+  </div>
+  <img class="tab" src="img/tab_br_unipd_dei.png" alt="Università degli Studi di Padova – Dipartimento di Ingegneria dell'Informazione">
+</footer>
+
+<script>
+// One clip at a time.
+document.addEventListener('play', e => {
+  document.querySelectorAll('audio').forEach(a => { if (a !== e.target) a.pause(); });
+}, true);
+document.getElementById('copy').addEventListener('click', e => {
+  navigator.clipboard.writeText(document.getElementById('bib').innerText)
+    .then(() => { e.target.textContent = 'Copied'; setTimeout(() => e.target.textContent = 'Copy', 1500); });
+});
+</script>
+</body>
+</html>

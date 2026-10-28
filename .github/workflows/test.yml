@@ -26,3 +26,45 @@ jobs:
 
       - name: Public-API link check (libaria.a)
         run: make example   # compiles examples/generate.c against build/libaria.a
+
+  # MSVC build of the same sources + the same hermetic tests (build.bat = the Makefile's
+  # Windows counterpart). The MSVC build compiles the scalar, single-threaded CPU path.
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (MSVC, CPU) + hermetic unit tests
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+          call build.bat test
+
+      - name: CLI smoke test
+        run: build\aria.exe --help
+
+  # The documented Windows CUDA build. No GPU on the runner, so this only checks that it
+  # compiles and links; the tests run in the CPU job above.
+  windows-cuda:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      # headers + import libs only (no cuBLAS DLLs): enough to compile and link
+      - name: Install CUDA toolkit (nvcc + cuBLAS dev)
+        shell: pwsh
+        run: |
+          $ver = "12.6.3"; $mm = "12.6"
+          Invoke-WebRequest "https://developer.download.nvidia.com/compute/cuda/$ver/network_installers/cuda_${ver}_windows_network.exe" -OutFile cuda.exe
+          # thrust = the CCCL headers (<nv/target>) that cuda_fp16.h includes
+          Start-Process .\cuda.exe -ArgumentList "-s nvcc_$mm cudart_$mm thrust_$mm cublas_dev_$mm" -Wait
+          $bin = "$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA\v$mm\bin"
+          & "$bin\nvcc.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "$bin" >> $env:GITHUB_PATH
+
+      - name: Build (MSVC + CUDA)
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+          call build.bat cuda

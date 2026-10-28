@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
+#include "test_tmp.h"
 
 int main(void) {
     int sr = 8000, ch = 2;
@@ -13,8 +14,9 @@ int main(void) {
         a->data[i*ch + 1] = 0.25f * sinf(2.0f * 3.14159265f * 440.0f * i / sr);
     }
 
-    const char *f32 = "/tmp/aria_test_f32.wav";
-    const char *p16 = "/tmp/aria_test_p16.wav";
+    char f32[512], p16[512];
+    tmp_path(f32, sizeof f32, "aria_test_f32.wav");
+    tmp_path(p16, sizeof p16, "aria_test_p16.wav");
 
     /* float32 round-trip: exact */
     if (aria_wav_write(f32, a, 32) != 0) { printf("FAIL write f32\n"); return 1; }

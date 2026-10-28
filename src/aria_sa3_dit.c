@@ -3,6 +3,7 @@
  */
 
 #include "aria_sa3_dit.h"
+#include "aria_win_compat.h"
 #include "aria_ops.h"
 #include "aria_quant.h"
 #include "aria_cond.h"
@@ -11,8 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <sys/mman.h>   /* B2: MADV_DONTNEED the mmap'd source once the overlay copies it */
+#ifndef _WIN32
+#include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 static inline float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
 

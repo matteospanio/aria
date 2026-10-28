@@ -58,6 +58,10 @@ static int run(int M, int K, int N, int wt, int bias, int nth) {
 }
 
 int main(void) {
+#if !((defined(__AVX2__) && defined(__FMA__)) || defined(__ARM_NEON))
+    printf("test_gemm: SKIP (scalar build: no packed GEMM)\n");   /* e.g. MSVC, ARCHFLAGS="" */
+    return 0;
+#endif
     static const int S[][3] = {   /* M, K, N: edge tiles, K blocks, attention/decoder shapes */
         {1, 64, 16}, {5, 100, 17}, {6, 1024, 256}, {7, 2048, 1000}, {34, 768, 3840},
         {64, 64, 257}, {64, 64, 710}, {172, 1024, 1024}, {13, 2049, 1024}, {40, 2304, 768},

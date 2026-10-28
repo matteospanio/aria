@@ -11,6 +11,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include "test_tmp.h"
+#ifdef _WIN32
+#include <io.h>      /* _mktemp_s */
+#endif
 
 static int fails = 0;
 static void ok(const char *name, int cond) {
@@ -43,7 +47,7 @@ static void ref_lora(float *y, const float *x, const float *W, int M, int in, in
 }
 
 static void test_op(void) {
-    const int M = 3, in = 6, out = 5, rank = 4;
+    enum { M = 3, in = 6, out = 5, rank = 4 };   /* constants, not VLAs (MSVC has none) */
     float x[M * in], W[out * in], down[rank * in], up[out * rank];
     fill(x, M * in, 1); fill(W, out * in, 2); fill(down, rank * in, 3); fill(up, out * rank, 4);
 
@@ -114,7 +118,7 @@ static void test_name_map(void) {
 
 /* ---- loader: write a minimal safetensors adapter and load it ---- */
 static void test_loader(void) {
-    const int rank = 4, in = 6, out = 9;
+    enum { rank = 4, in = 6, out = 9 };
     float down[rank * in], up[out * rank];
     fill(down, rank * in, 7); fill(up, out * rank, 8);
     size_t dsz = sizeof down, usz = sizeof up;   /* 96, 144 bytes */
@@ -130,11 +134,16 @@ static void test_loader(void) {
         "{\"dtype\":\"F32\",\"shape\":[%d,%d],\"data_offsets\":[%zu,%zu]}}",
         rank, in, dsz, out, rank, dsz, dsz + usz);
 
-    char path[] = "/tmp/aria_lora_testXXXXXX";
+    char path[512];
+    tmp_path(path, sizeof path, "aria_lora_testXXXXXX");
+#ifdef _WIN32
+    FILE *f = _mktemp_s(path, strlen(path) + 1) == 0 ? fopen(path, "wb") : NULL;
+#else
     int fd = mkstemp(path);
-    ok("mkstemp", fd >= 0);
-    if (fd < 0) return;
-    FILE *f = fdopen(fd, "wb");
+    FILE *f = fd >= 0 ? fdopen(fd, "wb") : NULL;
+#endif
+    ok("temp file", f != NULL);
+    if (!f) return;
     uint64_t hlen = (uint64_t)hn;   /* x86 host: little-endian */
     fwrite(&hlen, 8, 1, f);
     fwrite(header, 1, hn, f);
