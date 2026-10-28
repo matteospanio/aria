@@ -16,6 +16,8 @@
  *   GET  /health            -> {"ok":true}
  *   GET  /info              -> model type / sample rate / channels
  *   GET  /steers            -> the named steering directions loaded with --steer-dir
+ *   POST /stream            -> a live session: framed audio + events (see aria_live.h)
+ *   POST /stream/control    -> change a live session: prompt, steer, seed, ... and credits
  *   POST /generate          -> audio/wav (float32)
  *     {"prompt":"...", "seconds":10, "steps":8, "seed":11, "steer":"sweet:0.3,sour:0.1"}
  *     named steering is optional; the older single-steer form still works:
@@ -25,8 +27,10 @@
 
 #include "aria.h"
 #include "aria_json.h"
+#include "aria_live.h"
 #include "aria_net.h"
 #include "aria_parity.h"
+#include "aria_stream.h"
 
 #include <dirent.h>
 #include <pthread.h>
@@ -47,7 +51,7 @@ static void on_sigint(int sig) {
     (void)sig;
     if (g_stop) _exit(130);
     g_stop = 1;
-    if (g_listen_fd != ARIA_SOCK_BAD) { aria_sock fd = g_listen_fd; g_listen_fd = ARIA_SOCK_BAD; aria_sock_close(fd); }
+    if (g_listen_fd != ARIA_SOCK_BAD) aria_sock_wake(g_listen_fd);   /* unblocks accept() in main */
 }
 
 /* ---------------- log: one timestamped line per event, tagged with a request id -------- */
@@ -87,36 +91,27 @@ typedef struct job {
     void *wav; size_t wav_len;
     char err[256];
     int done;
+    double t_queued;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     struct job *next;
 } job;
 
+/* q.mu guards the job queue AND all live-session state below: one lock, one condvar the
+ * worker sleeps on (jobs, controls, credits and disconnects all signal it) */
 static struct {
-    job *head, *tail;
+    job *head, *tail; int n;
     pthread_mutex_t mu;
     pthread_cond_t cv;
-} q = { NULL, NULL, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER };
+} q = { NULL, NULL, 0, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER };
 
-static void q_push(job *j) {
-    pthread_mutex_lock(&q.mu);
-    if (q.tail) q.tail->next = j; else q.head = j;
-    q.tail = j;
-    pthread_cond_signal(&q.cv);
-    pthread_mutex_unlock(&q.mu);
-}
+static int g_max_queue = 32, g_max_sessions = 1;
+static double g_max_wait = 10.0;      /* a /generate job waits at most this long for live sessions */
+static double g_job_rate = 1.0;       /* EMA: generate seconds per second of audio (clips and chunks) */
+static int g_rate_n;
+static void rate_update(double r) { g_job_rate = g_rate_n++ ? 0.7 * g_job_rate + 0.3 * r : r; }   /* q.mu held */
 
-static job *q_pop_wait(void) {
-    pthread_mutex_lock(&q.mu);
-    while (!q.head && !g_stop) {
-        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 1;
-        pthread_cond_timedwait(&q.cv, &q.mu, &ts);
-    }
-    job *j = q.head;
-    if (j) { q.head = j->next; if (!q.head) q.tail = NULL; }
-    pthread_mutex_unlock(&q.mu);
-    return j;
-}
+static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 
 typedef struct {
     aria_ctx *ctx;
@@ -125,11 +120,8 @@ typedef struct {
     float default_seconds;
 } worker_cfg;
 
-static void *worker_main(void *arg) {
-    worker_cfg *w = (worker_cfg *)arg;
-    for (;;) {
-        job *j = q_pop_wait();
-        if (!j) { if (g_stop) return NULL; continue; }
+static void run_job(const worker_cfg *w, job *j) {
+    {
         aria_gen_params p = ARIA_GEN_PARAMS_DEFAULT;
         p.prompt = j->prompt;
         p.seconds_total = j->seconds > 0 ? j->seconds : w->default_seconds;
@@ -159,6 +151,7 @@ static void *worker_main(void *arg) {
             logline(j->id, "generate \"%s\" %.1fs steps=%s seed=%lld%s -> %.2fs", pe,
                     p.seconds_total, stp, (long long)p.seed, p.steer ? " steered" : "", dt);
         }
+        if (rc == 0 && p.seconds_total > 0) { pthread_mutex_lock(&q.mu); rate_update(dt / p.seconds_total); pthread_mutex_unlock(&q.mu); }
         pthread_mutex_lock(&j->mu);
         j->done = 1;
         pthread_cond_signal(&j->cv);
@@ -333,6 +326,233 @@ static int steer_items(const float *scale, aria_steer *out) {
     return n;
 }
 
+static void steer_desc(const float *scale, char *out, size_t n) {
+    size_t k = 0; out[0] = 0;
+    for (int i = 0; i < g_nsteers && k + 64 < n; i++)
+        if (scale[i] != 0.0f) k += (size_t)snprintf(out + k, n - k, "%s%s:%.2f", k ? "," : "", g_steers[i].name, scale[i]);
+    if (!k) snprintf(out, n, "-");
+}
+
+/* ---------------- live sessions (POST /stream) ---------------------------------------------
+ * The worker generates each session's chunks with aria_stream and queues the framed
+ * output on the session's outbox; the session's connection thread writes it out. All
+ * session fields are guarded by q.mu except `s` (worker only). Controls are latest-wins
+ * and land on the next chunk. Two references: the worker's list and the connection. */
+
+typedef struct outf { struct outf *next; size_t len; unsigned char b[]; } outf;
+
+#define LIVE_SEED 1
+#define LIVE_EVOLVE 2
+#define LIVE_ANCHOR 4
+#define OB_MAX ((size_t)2 << 20)   /* outbox bytes (~1.5 s of stereo f32) before the worker waits */
+
+typedef struct live {
+    struct live *next;
+    char id[16];
+    int refs;
+    aria_gen_params base; aria_stream_cfg cfg;
+    int sr, ch;
+    int64_t ahead_fr, emit_fr;
+    aria_stream *s;                       /* worker only */
+    char prompt[1024]; int prompt_id;     /* controls (latest wins) */
+    float scale[MAX_STEERS];
+    int64_t seed; int evolve; float anchor; int dirty;
+    int ctl, stop, closing;
+    int busy, chunks, ended, finished;    /* progress; finished = DONE is queued */
+    int64_t sent, played;
+    double est_gen, t0;
+    outf *oh, *ot; size_t ob_bytes;
+    pthread_cond_t ob_cv;
+    char reason[16];
+} live;
+
+static live *g_live;
+static int g_nlive, g_nstreams;
+static unsigned g_nsess;
+
+static outf *frame_new(const char *tag, const void *pre, size_t plen, const void *pay, size_t len) {
+    outf *f = malloc(sizeof *f + 8 + plen + len);
+    if (!f) return NULL;
+    f->next = NULL; f->len = 8 + plen + len;
+    live_hdr(f->b, tag, (uint32_t)(plen + len));
+    if (plen) memcpy(f->b + 8, pre, plen);
+    if (len) memcpy(f->b + 8 + plen, pay, len);
+    return f;
+}
+static outf *frame_json(const char *tag, const char *json) { return frame_new(tag, NULL, 0, json, strlen(json)); }
+
+/* audio [start, start+n) as AUDI frames of <= 1 s, chained */
+static outf *frames_audio(const float *a, int64_t start, int64_t n, int sr, int ch, outf **last) {
+    outf *head = NULL, *tail = NULL;
+    for (int64_t off = 0; off < n; off += sr) {
+        int64_t k = n - off < sr ? n - off : sr;
+        uint64_t at = (uint64_t)(start + off);
+        outf *f = frame_new("AUDI", &at, 8, a + off * ch, (size_t)k * ch * sizeof(float));
+        if (!f) break;
+        if (tail) tail->next = f; else head = f;
+        tail = f;
+    }
+    *last = tail;
+    return head;
+}
+
+static void ob_append(live *L, outf *head, outf *tail) {   /* q.mu held */
+    if (!head) return;
+    for (outf *f = head; f; f = f->next) L->ob_bytes += f->len;
+    if (L->ot) L->ot->next = head; else L->oh = head;
+    L->ot = tail;
+    pthread_cond_signal(&L->ob_cv);
+}
+
+static void live_unref(live *L) {   /* q.mu held */
+    if (--L->refs) return;
+    while (L->oh) { outf *f = L->oh; L->oh = f->next; free(f); }
+    pthread_cond_destroy(&L->ob_cv);
+    free(L);
+}
+
+static void fmt_t(char *b, size_t n, int64_t frames, int sr) {
+    double t = (double)frames / sr;
+    snprintf(b, n, "%02d:%05.2f", (int)(t / 60), t - 60 * (int)(t / 60));
+}
+
+/* worker: create the session's stream and announce it */
+static void live_open(const worker_cfg *w, live *L) {   /* q.mu held (released inside) */
+    pthread_mutex_unlock(&q.mu);
+    aria_stream *s = aria_stream_open(w->ctx, &L->base, &L->cfg);
+    char json[512], err[300];
+    if (!s) aria_json_escape(aria_last_error(), err, sizeof err);
+    pthread_mutex_lock(&q.mu);
+    if (!s) {
+        snprintf(json, sizeof json, "{\"error\":\"%s\"}", err);
+        outf *f = frame_json("ERRO", json); ob_append(L, f, f);
+        snprintf(L->reason, sizeof L->reason, "error");
+        L->stop = 1;
+        logline(L->id, "open failed: %s", err);
+        return;
+    }
+    L->s = s;
+    L->t0 = now_s();
+    char sd[256]; steer_desc(L->scale, sd, sizeof sd);
+    snprintf(json, sizeof json, "{\"session\":\"%s\",\"sample_rate\":%d,\"channels\":%d,\"seed\":%lld,"
+             "\"chunk\":%.2f,\"context\":%.2f,\"ahead\":%.2f,\"xfade\":%.2f,\"prompt_id\":%d,\"steer\":\"%s\"}",
+             L->id, L->sr, L->ch, (long long)aria_stream_seed(s), L->cfg.chunk_s, L->cfg.context_s,
+             (double)L->ahead_fr / L->sr, ARIA_STREAM_XFADE_S, L->prompt_id, sd);
+    outf *f = frame_json("HELO", json); ob_append(L, f, f);
+}
+
+/* worker: generate the session's next chunk with its current controls */
+static void live_chunk(live *L) {   /* q.mu held (released while generating) */
+    char prompt[1024]; float sc[MAX_STEERS];
+    memcpy(prompt, L->prompt, sizeof prompt); memcpy(sc, L->scale, sizeof sc);
+    int dirty = L->dirty, ctl = L->ctl, pid = L->prompt_id;
+    int64_t seed = L->seed; int evolve = L->evolve; float anchor = L->anchor;
+    L->dirty = 0; L->busy = 1;
+    pthread_mutex_unlock(&q.mu);
+
+    if (dirty & LIVE_SEED) aria_stream_set_seed(L->s, seed);
+    if (dirty & LIVE_EVOLVE) aria_stream_set_evolve(L->s, evolve);
+    if (dirty & LIVE_ANCHOR) aria_stream_set_anchor(L->s, anchor);
+    aria_steer items[MAX_STEERS]; int n = steer_items(sc, items);
+    aria_steer_set set = { items, n };
+    const float *audio = NULL; aria_stream_stats st;
+    int rc = aria_stream_next(L->s, prompt, n ? &set : NULL, &audio, &st);
+    outf *head = NULL, *tail = NULL;
+    char err[300] = "";
+    if (rc == 0) head = frames_audio(audio, st.start, st.frames, L->sr, L->ch, &tail);
+    else aria_json_escape(aria_last_error(), err, sizeof err);
+
+    pthread_mutex_lock(&q.mu);
+    L->busy = 0;
+    if (rc != 0) {
+        char json[400]; snprintf(json, sizeof json, "{\"error\":\"%s\"}", err);
+        outf *f = frame_json("ERRO", json); ob_append(L, f, f);
+        snprintf(L->reason, sizeof L->reason, "error");
+        L->stop = 1;
+        logline(L->id, "chunk %d failed: %s", L->chunks, err);
+        return;
+    }
+    ob_append(L, head, tail);
+    L->sent = st.start + st.frames;
+    L->chunks++;
+    L->est_gen = L->chunks == 1 ? st.gen_s : 0.7 * L->est_gen + 0.3 * st.gen_s;
+    if (st.win_s > 0) rate_update(st.gen_s / st.win_s);
+    double ahead = (double)(L->sent - L->played) / L->sr, rtf = st.gen_s > 0 ? st.emit_s / st.gen_s : 0.0;
+    char sd[256], json[640], at[16];
+    steer_desc(sc, sd, sizeof sd);
+    snprintf(json, sizeof json, "{\"chunk\":%d,\"at\":%lld,\"end\":%lld,\"gen_ms\":%d,\"rtf\":%.2f,\"ahead_ms\":%d,"
+             "\"seed\":%lld,\"ctl\":%d,\"prompt_id\":%d,\"steer\":\"%s\"}",
+             st.chunk, (long long)st.start, (long long)L->sent, (int)(st.gen_s * 1000), rtf, (int)(ahead * 1000),
+             (long long)st.seed, ctl, pid, sd);
+    outf *f = frame_json("EVNT", json); ob_append(L, f, f);
+    fmt_t(at, sizeof at, st.start, L->sr);
+    logline(L->id, "chunk %d at=%s +%.2fs gen=%dms rtf=%.1fx ahead=%.2fs prompt#%d seed=%lld steer=%s",
+            st.chunk, at, (double)st.frames / L->sr, (int)(st.gen_s * 1000), rtf, ahead, pid, (long long)st.seed, sd);
+}
+
+/* worker: finish a session (flush the held-back tail unless the client is gone) */
+static void live_end(live *L) {   /* q.mu held (released while flushing) */
+    L->ended = 1;
+    if (!L->reason[0]) snprintf(L->reason, sizeof L->reason, "%s", L->closing ? "client" : L->stop ? "stop" : "shutdown");
+    int flush = L->s && !L->closing;
+    pthread_mutex_unlock(&q.mu);
+    outf *head = NULL, *tail = NULL; int64_t start = 0, n = 0;
+    if (flush) {
+        const float *audio;
+        n = aria_stream_flush(L->s, &audio);
+        if (n > 0) head = frames_audio(audio, start = L->sent, n, L->sr, L->ch, &tail);
+    }
+    aria_stream_close(L->s);
+    pthread_mutex_lock(&q.mu);
+    L->s = NULL;
+    if (n > 0) { ob_append(L, head, tail); L->sent = start + n; }
+    char json[96]; snprintf(json, sizeof json, "{\"reason\":\"%s\",\"frames\":%lld}", L->reason, (long long)L->sent);
+    outf *f = frame_json("DONE", json); ob_append(L, f, f);
+    L->finished = 1;
+    for (live **pp = &g_live; *pp; pp = &(*pp)->next) if (*pp == L) { *pp = L->next; break; }
+    g_nlive--;
+    char dur[16]; fmt_t(dur, sizeof dur, L->sent, L->sr);
+    logline(L->id, "close reason=%s audio=%s chunks=%d", L->reason, dur, L->chunks);
+    pthread_cond_broadcast(&L->ob_cv);
+    live_unref(L);
+}
+
+/* the single worker: owns the model; a deadline-first scheduler over live sessions, with
+ * /generate jobs in the gaps (or after --max-wait seconds regardless) */
+static void *worker_main(void *arg) {
+    const worker_cfg *w = (const worker_cfg *)arg;
+    pthread_mutex_lock(&q.mu);
+    for (;;) {
+        live *L, *pick = NULL;
+        for (L = g_live; L; L = L->next) if (L->stop || L->closing || g_stop) break;
+        if (L) { live_end(L); continue; }
+        for (L = g_live; L; L = L->next) if (!L->s) break;
+        if (L) { live_open(w, L); continue; }
+        double best = 1e30, min_slack = 1e30;
+        for (L = g_live; L; L = L->next) {
+            double slack = (double)(L->sent - L->played) / L->sr - L->est_gen;
+            if (slack < min_slack) min_slack = slack;
+            if (live_gate(L->sent, L->played, L->ahead_fr, L->ob_bytes, OB_MAX) && slack < best) { best = slack; pick = L; }
+        }
+        job *j = q.head;
+        if (j && (now_s() - j->t_queued > g_max_wait ||
+                  (!pick && (!g_live || min_slack > g_job_rate * (j->seconds > 0 ? j->seconds : w->default_seconds))))) {
+            q.head = j->next; if (!q.head) q.tail = NULL; q.n--;
+            pthread_mutex_unlock(&q.mu);
+            run_job(w, j);
+            pthread_mutex_lock(&q.mu);
+            continue;
+        }
+        if (pick) { live_chunk(pick); continue; }
+        if (g_stop && !g_live && !q.head) break;
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 250000000L; if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&q.cv, &q.mu, &ts);
+    }
+    pthread_mutex_unlock(&q.mu);
+    return NULL;
+}
+
 static int parse_steer_json(const char *body, aria_steer *st, char *err, size_t errlen) {
     char path[1024];
     if (aria_json_get_string(body, "steer_dir", path, sizeof path) != 0) return 0; /* no steer */
@@ -411,7 +631,20 @@ static void handle_generate(aria_sock fd, const char *id, const char *body) {
         return;
     }
 
-    q_push(j);
+    pthread_mutex_lock(&q.mu);
+    if (g_stop || q.n >= g_max_queue) {
+        int stopping = g_stop;
+        pthread_mutex_unlock(&q.mu);
+        respond_err(fd, id, 503, "Service Unavailable", stopping ? "shutting down" : "generate queue full");
+        free(j->prompt); free((void *)j->steer.dir);
+        pthread_mutex_destroy(&j->mu); pthread_cond_destroy(&j->cv); free(j);
+        return;
+    }
+    j->t_queued = now_s();
+    if (q.tail) q.tail->next = j; else q.head = j;
+    q.tail = j; q.n++;
+    pthread_cond_signal(&q.cv);
+    pthread_mutex_unlock(&q.mu);
     pthread_mutex_lock(&j->mu);
     while (!j->done) pthread_cond_wait(&j->cv, &j->mu);
     pthread_mutex_unlock(&j->mu);
@@ -421,6 +654,148 @@ static void handle_generate(aria_sock fd, const char *id, const char *body) {
     free(j->wav); free(j->prompt); free((void *)j->steer.dir);
     pthread_mutex_destroy(&j->mu); pthread_cond_destroy(&j->cv);
     free(j);
+}
+
+static const worker_cfg *g_wcfg;   /* defaults for live sessions (device, steps) */
+
+/* POST /stream: open a live session, then write its frames until it ends */
+static void handle_stream(aria_sock fd, const char *id, const char *body) {
+    char err[256] = "", spec[512];
+    double v;
+    live *L = calloc(1, sizeof *L);
+    if (!L) { respond_err(fd, id, 500, "Internal Server Error", "oom"); return; }
+    if (aria_json_get_string(body, "prompt", L->prompt, sizeof L->prompt) != 0) {
+        free(L); respond_err(fd, id, 400, "Bad Request", "missing 'prompt'"); return;
+    }
+    float chunk = aria_json_get_number(body, "chunk", &v) == 0 ? (float)v : 2.0f;
+    float context = aria_json_get_number(body, "context", &v) == 0 ? (float)v : 6.0f;
+    float ahead = aria_json_get_number(body, "ahead", &v) == 0 ? (float)v : chunk;
+    if (!(chunk >= 0.5f && chunk <= 30.0f) || !(context >= 1.0f && context <= 30.0f) || !(ahead >= 0.0f && ahead <= 60.0f)) {
+        free(L); respond_err(fd, id, 400, "Bad Request", "chunk must be 0.5-30 s, context 1-30 s, ahead 0-60 s"); return;
+    }
+    if (aria_json_get_string(body, "steer", spec, sizeof spec) == 0 &&
+        parse_steer_spec(spec, L->scale, 0, err, sizeof err) < 0) {
+        free(L); respond_err(fd, id, 400, "Bad Request", err); return;
+    }
+    aria_gen_params base = ARIA_GEN_PARAMS_DEFAULT;
+    base.seed = aria_json_get_number(body, "seed", &v) == 0 ? (int64_t)v : -1;
+    base.steps = aria_json_get_number(body, "steps", &v) == 0 && v > 0 ? (int)v : g_wcfg->default_steps;
+    base.device = g_wcfg->device;
+    aria_stream_cfg cfg = ARIA_STREAM_CFG_DEFAULT;
+    cfg.chunk_s = chunk; cfg.context_s = context;
+    cfg.anchor = aria_json_get_number(body, "anchor", &v) == 0 ? (float)v : 0.0f;
+    cfg.evolve = aria_json_get_number(body, "evolve", &v) == 0 ? (int)v : 0;
+    L->base = base; L->cfg = cfg;
+    L->sr = aria_sample_rate(g_ctx); L->ch = aria_audio_channels(g_ctx);
+    L->ahead_fr = (int64_t)(ahead * L->sr); L->emit_fr = (int64_t)(chunk * L->sr);
+    L->prompt_id = 1; L->refs = 2;
+    pthread_cond_init(&L->ob_cv, NULL);
+
+    pthread_mutex_lock(&q.mu);
+    if (g_stop || g_nlive >= g_max_sessions) {
+        int stopping = g_stop;
+        pthread_mutex_unlock(&q.mu);
+        pthread_cond_destroy(&L->ob_cv); free(L);
+        if (stopping) { respond_err(fd, id, 503, "Service Unavailable", "shutting down"); return; }
+        char b[128]; snprintf(b, sizeof b, "{\"error\":\"at capacity (%d live session%s)\",\"retry_after\":5}",
+                              g_max_sessions, g_max_sessions == 1 ? "" : "s");
+        logline(id, "503 at capacity (%d live)", g_max_sessions);
+        respond_json(fd, 503, "Service Unavailable", b);
+        return;
+    }
+    snprintf(L->id, sizeof L->id, "s%u", ++g_nsess);
+    live **pp = &g_live; while (*pp) pp = &(*pp)->next; *pp = L;
+    g_nlive++; g_nstreams++;
+    pthread_cond_signal(&q.cv);
+    pthread_mutex_unlock(&q.mu);
+    char pe[128], sd[256]; aria_json_escape(L->prompt, pe, sizeof pe); steer_desc(L->scale, sd, sizeof sd);
+    logline(L->id, "open (%s) \"%s\" chunk=%.1f context=%.1f ahead=%.1f seed=%lld steer=%s",
+            id, pe, chunk, context, ahead, (long long)base.seed, sd);
+
+    static const char hdr[] = "HTTP/1.1 200 OK\r\nContent-Type: application/x-aria-stream\r\n"
+                              "Cache-Control: no-store\r\nConnection: close\r\n\r\n";
+    int ok = aria_send_all(fd, hdr, sizeof hdr - 1) == 0;
+    pthread_mutex_lock(&q.mu);
+    while (ok) {
+        while (!L->oh && !L->finished) {
+            struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 250000000L; if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            if (pthread_cond_timedwait(&L->ob_cv, &q.mu, &ts) != 0 && aria_peer_gone(fd)) { ok = 0; break; }
+        }
+        if (!ok || !L->oh) break;   /* client gone, or finished and drained */
+        outf *f = L->oh;
+        L->oh = f->next; if (!L->oh) L->ot = NULL;
+        L->ob_bytes -= f->len;
+        pthread_cond_signal(&q.cv);   /* outbox space: the worker may generate again */
+        pthread_mutex_unlock(&q.mu);
+        ok = aria_send_all(fd, f->b, f->len) == 0;
+        free(f);
+        pthread_mutex_lock(&q.mu);
+    }
+    if (!L->ended) { L->closing = 1; pthread_cond_signal(&q.cv); }
+    g_nstreams--;
+    live_unref(L);
+    pthread_mutex_unlock(&q.mu);
+}
+
+/* POST /stream/control: change a live session (applies to its next chunk) and/or credit
+ * the frames the client has played */
+static void handle_control(aria_sock fd, const char *id, const char *body) {
+    char sid[16], err[256] = "", spec[512], prompt[1024];
+    double v;
+    if (aria_json_get_string(body, "session", sid, sizeof sid) != 0) { respond_err(fd, id, 400, "Bad Request", "missing 'session'"); return; }
+    pthread_mutex_lock(&q.mu);
+    live *L = g_live;
+    while (L && strcmp(L->id, sid)) L = L->next;
+    if (!L || L->ended) {
+        pthread_mutex_unlock(&q.mu);
+        respond_err(fd, id, 404, "Not Found", "no such session");
+        return;
+    }
+    float sc[MAX_STEERS]; memcpy(sc, L->scale, sizeof sc);
+    int has_steer = aria_json_get_string(body, "steer", spec, sizeof spec) == 0;
+    if (has_steer && parse_steer_spec(spec, sc, 1, err, sizeof err) < 0) {   /* validate before changing anything */
+        pthread_mutex_unlock(&q.mu);
+        respond_err(fd, id, 400, "Bad Request", err);
+        return;
+    }
+    int changed = 0;
+    char what[1400] = "";
+    size_t wl = 0;
+    if (aria_json_get_string(body, "prompt", prompt, sizeof prompt) == 0 && prompt[0]) {
+        memcpy(L->prompt, prompt, sizeof prompt); L->prompt_id++; changed = 1;
+        char pe[128]; aria_json_escape(prompt, pe, sizeof pe);
+        wl += (size_t)snprintf(what + wl, sizeof what - wl, " prompt#%d=\"%s\"", L->prompt_id, pe);
+    }
+    if (has_steer) {
+        memcpy(L->scale, sc, sizeof sc); changed = 1;
+        char sd[256]; steer_desc(sc, sd, sizeof sd);
+        wl += (size_t)snprintf(what + wl, sizeof what - wl, " steer=%s", sd);
+    }
+    if (aria_json_get_number(body, "seed", &v) == 0) {
+        L->seed = (int64_t)v; L->dirty |= LIVE_SEED; changed = 1;
+        wl += (size_t)snprintf(what + wl, sizeof what - wl, " seed=%lld", (long long)L->seed);
+    }
+    if (aria_json_get_number(body, "evolve", &v) == 0) {
+        L->evolve = (int)v; L->dirty |= LIVE_EVOLVE; changed = 1;
+        wl += (size_t)snprintf(what + wl, sizeof what - wl, " evolve=%d", L->evolve);
+    }
+    if (aria_json_get_number(body, "anchor", &v) == 0) {
+        L->anchor = (float)v; L->dirty |= LIVE_ANCHOR; changed = 1;
+        wl += (size_t)snprintf(what + wl, sizeof what - wl, " anchor=%.2f", L->anchor);
+    }
+    int stop = 0;
+    if (aria_json_get_bool_in(body, NULL, "stop", &stop) == 0 && stop) { L->stop = 1; changed = 1; wl += (size_t)snprintf(what + wl, sizeof what - wl, " stop"); }
+    if (aria_json_get_number(body, "played", &v) == 0 && (int64_t)v > L->played) L->played = (int64_t)v;
+    if (changed) L->ctl++;
+    int64_t lands = live_lands(L->sent, L->busy, L->emit_fr);
+    char resp[160];
+    snprintf(resp, sizeof resp, "{\"ok\":true,\"ctl\":%d,\"lands\":%lld,\"sent\":%lld,\"played\":%lld}",
+             L->ctl, (long long)lands, (long long)L->sent, (long long)L->played);
+    if (changed) { char at[16]; fmt_t(at, sizeof at, lands, L->sr); logline(L->id, "ctl#%d%s lands@%s", L->ctl, what, at); }
+    pthread_cond_signal(&q.cv);
+    pthread_mutex_unlock(&q.mu);
+    respond_json(fd, 200, "OK", resp);
 }
 
 static void *conn_main(void *arg) {
@@ -454,10 +829,14 @@ static void *conn_main(void *arg) {
         respond_json(fd, 200, "OK", out);
     } else if (!strncmp(req, "POST /generate", 14)) {
         handle_generate(fd, id, body);
+    } else if (!strncmp(req, "POST /stream/control", 20)) {
+        handle_control(fd, id, body);
+    } else if (!strncmp(req, "POST /stream", 12)) {
+        handle_stream(fd, id, body);   /* lasts as long as the client listens */
     } else {
         char line[64]; size_t k = strcspn(req, "\r\n"); if (k > 48) k = 48;
         memcpy(line, req, k); line[k] = 0;
-        char msg[192]; snprintf(msg, sizeof msg, "no route for '%s' (GET /health, GET /info, GET /steers, POST /generate)", line);
+        char msg[192]; snprintf(msg, sizeof msg, "no route for '%s' (GET /health, GET /info, GET /steers, POST /generate, POST /stream, POST /stream/control)", line);
         respond_err(fd, id, 404, "Not Found", msg);
     }
     free(req);
@@ -475,7 +854,10 @@ static void usage(FILE *f, const char *prog) {
             "  --bind   address to listen on (default 127.0.0.1; 0.0.0.0 = every interface, no auth)\n"
             "  --log    append the activity log to <file> (default stderr)\n"
             "  --steer-dir <dir>  load named steering directions (*.atns + dirs_meta.json, the\n"
-            "           Hugging Face matteospanio/aria layout, e.g. directions/small); repeatable\n", prog);
+            "           Hugging Face matteospanio/aria layout, e.g. directions/small); repeatable\n"
+            "  --max-sessions <n>  concurrent live sessions (default 1)\n"
+            "  --queue <n>         queued /generate jobs before 503 (default 32)\n"
+            "  --max-wait <s>      longest a /generate job yields to live sessions (default 10)\n", prog);
 }
 
 #ifndef ARIA_SERVER_NO_MAIN   /* tests/test_server.c includes this file for its helpers */
@@ -490,6 +872,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--bind") && i + 1 < argc) bind_ip = argv[++i];
         else if (!strcmp(argv[i], "--log") && i + 1 < argc) log_path = argv[++i];
         else if (!strcmp(argv[i], "--steer-dir") && i + 1 < argc && n_steer_dirs < 8) steer_dirs[n_steer_dirs++] = argv[++i];
+        else if (!strcmp(argv[i], "--max-sessions") && i + 1 < argc) g_max_sessions = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--queue") && i + 1 < argc) g_max_queue = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--max-wait") && i + 1 < argc) g_max_wait = atof(argv[++i]);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(stdout, argv[0]); return 0; }
         else if (!strcmp(argv[i], "-s") && i + 1 < argc) w.default_steps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-d") && i + 1 < argc) w.default_seconds = (float)atof(argv[++i]);
@@ -509,6 +894,7 @@ int main(int argc, char **argv) {
     g_ctx = aria_load(model_dir);
     if (!g_ctx) { logline(NULL, "load error: %s", aria_last_error()); return 1; }
     w.ctx = g_ctx;
+    g_wcfg = &w;
     logline(NULL, "model type=%s sr=%d ch=%d", aria_model_type(g_ctx), aria_sample_rate(g_ctx), aria_audio_channels(g_ctx));
     for (int i = 0; i < n_steer_dirs; i++) load_steer_dir(steer_dirs[i]);
 
@@ -526,14 +912,20 @@ int main(int argc, char **argv) {
 
     while (!g_stop) {
         aria_sock cfd = aria_accept(lfd);
-        if (cfd == ARIA_SOCK_BAD) { if (g_stop || g_listen_fd == ARIA_SOCK_BAD) break; continue; }
+        if (cfd == ARIA_SOCK_BAD) { if (g_stop) break; continue; }
         pthread_t th;
         if (pthread_create(&th, NULL, conn_main, (void *)(intptr_t)cfd) == 0) pthread_detach(th);
         else aria_sock_close(cfd);
     }
     g_stop = 1;
-    pthread_cond_broadcast(&q.cv);
+    aria_sock_close(lfd);
+    pthread_mutex_lock(&q.mu); pthread_cond_broadcast(&q.cv); pthread_mutex_unlock(&q.mu);
     pthread_join(worker, NULL);
+    for (int i = 0; i < 20; i++) {   /* let stream connections send their DONE */
+        pthread_mutex_lock(&q.mu); int n = g_nstreams; pthread_mutex_unlock(&q.mu);
+        if (!n) break;
+        struct timespec ts = { 0, 50000000L }; nanosleep(&ts, NULL);
+    }
     aria_free(g_ctx);
     logline(NULL, "bye");
     return 0;

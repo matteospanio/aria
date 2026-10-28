@@ -1476,7 +1476,8 @@ static void dit_run(aria_cuda_dit *h, cudaStream_t st) {
             if (cudaStreamEndCapture(st, &g) == cudaSuccess && g &&
                 ARIA_GRAPH_INST(&h->graph_exec, g) == cudaSuccess) {
                 h->graph = g; h->graph_ready = 1;
-                fprintf(stderr, "[aria] DiT: CUDA graph captured (%d blocks/step replayed)\n", h->depth);
+                static int announced;   /* streams re-capture per chunk: say it once */
+                if (!announced++) fprintf(stderr, "[aria] DiT: CUDA graph captured (%d blocks/step replayed)\n", h->depth);
                 cudaGraphLaunch(h->graph_exec, st);   /* execute step 0 (capture didn't run it) */
             } else {
                 cudaGetLastError(); h->graph_failed = 1;

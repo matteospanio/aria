@@ -28,6 +28,8 @@ typedef int aria_sock;
 
 static inline int aria_net_init(void) { return 0; }
 static inline void aria_sock_close(aria_sock s) { close(s); }
+/* wake a thread blocked in accept() on `s` (async-signal-safe; close() alone does not) */
+static inline void aria_sock_wake(aria_sock s) { shutdown(s, SHUT_RDWR); }
 
 /* send/recv timeouts; 0 = none */
 static inline void aria_sock_timeouts(aria_sock s, int ms) {
