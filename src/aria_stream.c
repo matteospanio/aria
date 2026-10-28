@@ -25,7 +25,7 @@ struct aria_stream {
     aria_audio *context, *anchor;
     int recapture;
     int64_t seed, base_seed; int evolve_k;
-    float *held; int64_t held_len; const char *held_prompt;   /* --hold drum loop */
+    float *held; int64_t held_len; char *held_prompt;   /* --hold drum loop + the prompt it belongs to */
     float *out; int64_t out_cap;                              /* the finalized frames returned */
 };
 
@@ -190,10 +190,11 @@ int aria_stream_next(aria_stream *s, const char *prompt, const aria_steer_set *s
         float *H = malloc((size_t)en * ch * sizeof(float)), *P = malloc((size_t)en * ch * sizeof(float));
         if (!H || !P) { free(H); free(P); aria_audio_free(emit); aria_set_error("stream: OOM"); return -1; }
         aria_hpss_separate(emit->data, en, ch, H, P);
-        if (!s->held || prompt != s->held_prompt) {   /* establish/reset the loop on chunk 0 or prompt change */
+        int same = prompt && s->held_prompt ? !strcmp(prompt, s->held_prompt) : prompt == s->held_prompt;
+        if (!s->held || !same) {   /* establish/reset the loop on chunk 0 or a new prompt text */
             free(s->held); s->held_len = en; s->held = malloc((size_t)s->held_len * ch * sizeof(float));
             memcpy(s->held, P, (size_t)s->held_len * ch * sizeof(float));
-            s->held_prompt = prompt;
+            free(s->held_prompt); s->held_prompt = prompt ? strdup(prompt) : NULL;
             st->hold_set = 1;
         }
         memcpy(emit->data, H, (size_t)en * ch * sizeof(float));   /* emit -> harmonic only */
@@ -277,5 +278,5 @@ void aria_stream_set_anchor(aria_stream *s, float beta) {
 void aria_stream_close(aria_stream *s) {
     if (!s) return;
     aria_audio_free(s->outp); aria_audio_free(s->context); aria_audio_free(s->anchor);
-    free(s->held); free(s->out); free(s);
+    free(s->held); free(s->held_prompt); free(s->out); free(s);
 }

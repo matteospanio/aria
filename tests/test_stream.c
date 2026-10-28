@@ -61,9 +61,10 @@ static int run(int chunks, int flush, int evolve, int hold, int64_t seed, acc *A
     if (!s) return 1;
     int bad = 0; int64_t expect = 0;
     const char *pa = "warm piano", *pb = "ambient pads";
+    char pa2[32]; strcpy(pa2, pa);   /* same text, another buffer: must not reset the loop */
     for (int i = 0; i < chunks; i++) {
         const float *x; aria_stream_stats st;
-        const char *pr = (hold && i >= 3) ? pb : pa;   /* a new prompt pointer at chunk 3 */
+        const char *pr = (hold && i >= 3) ? pb : (hold && i == 2) ? pa2 : pa;   /* new text at chunk 3 */
         if (aria_stream_next(s, pr, NULL, &x, &st) != 0) { bad = 1; break; }
         if (st.chunk != i || st.start != expect || st.frames <= 0) bad = 1;
         if (hold && st.hold_set != (i == 0 || i == 3)) bad = 1;
