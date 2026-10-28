@@ -448,22 +448,9 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     float *x = malloc((size_t)n * sizeof(float));
     aria_rng_randn(&rng, x, n);
 
-    /* schedule + pingpong */
-    /* default 6 steps: A/B vs 8 (12 prompts x 4 seeds, both models, 10 + 60 s) -- CLAP
-     * prompt similarity non-inferior everywhere (better at small 10 s), wav2taste drift
-     * below the seed-noise floor; 25 % fewer DiT forwards */
-    int steps = p->steps > 0 ? p->steps : 6;
-    float *sched = malloc((size_t)(steps + 1) * sizeof(float));
-    /* LEN (legacy, seq_len = T) stays the default until the reference schedule passes
-     * the A/B; REF/FULL follow the reference at its effective length. */
+    int steps = 0;
+    float *sched = NULL;   /* the schedule is built once the DiT's device is known */
     aria_schedule sk = p->schedule ? p->schedule : ARIA_SCHED_LEN;
-    if (sk == ARIA_SCHED_LEN) {
-        aria_dist_shift len; aria_dist_shift_defaults(&len, ARIA_SHIFT_LOGSNR);  /* rate 1, anchor 2000 */
-        aria_build_schedule(sched, steps, 1.0f, &len, T);
-    } else {
-        aria_build_schedule(sched, steps, 1.0f,
-                            sk == ARIA_SCHED_FULL ? &st->cfg.train_shift : &st->cfg.sample_shift, eff);
-    }
 
     int profile = getenv("ARIA_PROFILE") != NULL;
 
@@ -521,6 +508,22 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     }
     on_gpu = want_gpu && st->cdit;
 #endif
+
+    /* schedule. Default steps by where the DiT runs: 6 on a GPU (A/B vs 8, 12 prompts x 4
+     * seeds, both models, 10 + 60 s: CLAP non-inferior everywhere, wav2taste drift below
+     * the seed-noise floor), 4 on the CPU -- low-budget machines trade a little quality
+     * for a third fewer DiT forwards. */
+    steps = p->steps > 0 ? p->steps : on_gpu ? 6 : 4;
+    sched = malloc((size_t)(steps + 1) * sizeof(float));
+    /* LEN (legacy, seq_len = T) stays the default until the reference schedule passes
+     * the A/B; REF/FULL follow the reference at its effective length. */
+    if (sk == ARIA_SCHED_LEN) {
+        aria_dist_shift len; aria_dist_shift_defaults(&len, ARIA_SHIFT_LOGSNR);  /* rate 1, anchor 2000 */
+        aria_build_schedule(sched, steps, 1.0f, &len, T);
+    } else {
+        aria_build_schedule(sched, steps, 1.0f,
+                            sk == ARIA_SCHED_FULL ? &st->cfg.train_shift : &st->cfg.sample_shift, eff);
+    }
 
     /* CPU dequant overlay only when running on the CPU; the GPU path keeps st->dit
      * f32 so the host cross-K/V projection (and any CPU fallback) stays fast. */

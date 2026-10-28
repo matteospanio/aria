@@ -59,7 +59,7 @@ typedef struct {
     aria_device device;
     aria_dtype precision;
     int do_info, do_list, do_generate, do_stream, inpaint_continue, stream_hold, rng_torch;
-    int steps_set, fast;                    /* A1: --fast = 6-step preset unless -s is explicit */
+    int steps_set, fast;                    /* --fast = 4-step preset unless -s is explicit */
     int schedule;                           /* P0.1: aria_schedule (0 = runtime default) */
     float headroom;                         /* P0.3: reference duration_padding_sec (0 = off) */
     int util;                               /* 0 none / 1 wav-roundtrip / 2 hpss-test */
@@ -99,8 +99,8 @@ static const opt_spec OPTS[] = {
     {K_PEMB,     "prompt-embed",  0,  A_ONE,  "<file>",     "generate", "precomputed prompt embedding (.atns)"},
     {K_UNCOND,   "uncond",        0,  A_NONE, NULL,         "generate", "unconditional generation"},
     {K_DUR,      "",             'd', A_ONE,  "<sec>",      "generate", "duration in seconds (default 15)"},
-    {K_STEPS,    "",             's', A_ONE,  "<n>",        "generate", "denoise steps (default 6)"},
-    {K_FAST,     "fast",          0,  A_NONE, NULL,         "generate", "6 steps (now the default; kept for compatibility)"},
+    {K_STEPS,    "",             's', A_ONE,  "<n>",        "generate", "denoise steps (default 6 on a GPU, 4 on the CPU)"},
+    {K_FAST,     "fast",          0,  A_NONE, NULL,         "generate", "4 steps (the CPU default; on a GPU trades quality for speed)"},
     {K_SCHED,    "schedule",      0,  A_ONE,  "<s>",        "generate", "ref (stable_audio_3 generate) | len (legacy length-dependent) | full (TensorRT runtime)"},
     {K_HEADROOM, "headroom",      0,  A_ONE,  "<sec>",      "generate", "generate <sec> past the duration, then crop (reference uses 6; text->audio only)"},
     {K_SEED,     "seed",          0,  A_ONE,  "<n>",        "generate", "RNG seed (default random)"},
@@ -241,7 +241,7 @@ static int cli_parse(int argc, char **argv, cli_config *c) {
         if (o->arg == A_OPT && i + 1 < argc && argv[i + 1][0] != '-') args[0] = argv[++i];
         if (cli_apply(o->key, args, c)) return 1;
     }
-    if (c->fast && !c->steps_set) c->steps = 6;   /* A1: preset unless -s was explicit (order-independent) */
+    if (c->fast && !c->steps_set) c->steps = 4;   /* preset unless -s was explicit (order-independent) */
     return 0;
 }
 

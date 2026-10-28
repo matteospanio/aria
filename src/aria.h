@@ -36,7 +36,7 @@ typedef struct {
     const char *prompt;             /* text prompt (Phase 1) */
     const char *prompt_embed_path;  /* optional precomputed cross-attn embedding, f32 [256,768] */
     float seconds_total;            /* requested duration in seconds */
-    int   steps;                    /* denoising steps (0 = the model's default, 6 for SA3) */
+    int   steps;                    /* denoising steps (0 = default: 6 on a GPU, 4 on the CPU) */
     float cfg_scale;                /* CFG scale (default 1.0 = off) */
     int64_t seed;                   /* RNG seed (-1 = random) */
     aria_device device;             /* DiT backend: auto (default) / cpu / cuda (E8.5) */

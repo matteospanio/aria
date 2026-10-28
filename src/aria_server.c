@@ -916,7 +916,7 @@ static void usage(FILE *f, const char *prog) {
     fprintf(f,
             "aria-server - resident HTTP server for the aria runtime\n\n"
             "Usage: %s -m <model_dir> [--port 8321] [--bind 127.0.0.1] [--log <file>] [--steer-dir <dir>]...\n"
-            "          [--device cpu|cuda|auto] [-s <steps (default: the model's, 6)>] [-d <default_seconds=10>]\n\n"
+            "          [--device cpu|cuda|auto] [-s <steps (default 6 on a GPU, 4 on the CPU)>] [-d <default_seconds=10>]\n\n"
             "  --bind   address to listen on (default 127.0.0.1; 0.0.0.0 = every interface, no auth)\n"
             "  --log    append the activity log to <file> (default stderr)\n"
             "  --steer-dir <dir>  load named steering directions (*.atns + dirs_meta.json, the\n"
