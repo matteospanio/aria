@@ -126,3 +126,22 @@ int aria_json_get_number(const char *json, const char *key, double *out) {
     *out = d;
     return 0;
 }
+
+char *aria_json_escape(const char *s, char *out, size_t outlen) {
+    size_t i = 0;
+    for (; s && *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        int esc = (c == '"' || c == '\\');
+        if (i + (size_t)esc + 1 >= outlen) {
+            if ((c & 0xC0) == 0x80) {   /* mid UTF-8 character: drop its leading bytes too */
+                while (i > 0 && ((unsigned char)out[i - 1] & 0xC0) == 0x80) i--;
+                if (i > 0) i--;
+            }
+            break;
+        }
+        if (esc) out[i++] = '\\';
+        out[i++] = c < 0x20 ? ' ' : (char)c;
+    }
+    if (outlen) out[i] = '\0';
+    return out;
+}

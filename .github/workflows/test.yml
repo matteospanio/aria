@@ -27,6 +27,9 @@ jobs:
       - name: Public-API link check (libaria.a)
         run: make example   # compiles examples/generate.c against build/libaria.a
 
+      - name: Live server (POSIX)
+        run: make live && ./aria-server --help
+
   # MSVC build of the same sources + the same hermetic tests (build.bat = the Makefile's
   # Windows counterpart). The MSVC build compiles the scalar, single-threaded CPU path.
   windows:

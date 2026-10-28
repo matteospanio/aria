@@ -34,4 +34,9 @@ int aria_json_get_string_in(const char *start, const char *end, const char *key,
 /* Find "key": true/false (or 1/0) -> *out (0/1). Returns 0 on success. */
 int aria_json_get_bool_in(const char *start, const char *end, const char *key, int *out);
 
+/* Escape `s` as a JSON string body (no quotes) that the getters above read back:
+ * '"' and '\\' get a backslash, control characters become spaces. Truncates to fit
+ * `outlen`, never mid-escape. Returns `out`. */
+char *aria_json_escape(const char *s, char *out, size_t outlen);
+
 #endif /* ARIA_JSON_H */
