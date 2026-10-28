@@ -48,8 +48,9 @@ typedef struct {
 
 typedef struct aria_stream aria_stream;
 
-/* `base` is copied (prompt/steer/seed come from it unless overridden per chunk);
- * NULL + aria_last_error() on bad config or OOM. */
+/* `base` is copied (prompt/steer/seed come from it unless overridden per chunk); a
+ * negative base->seed draws a random one (see aria_stream_seed). NULL +
+ * aria_last_error() on bad config or OOM. */
 aria_stream *aria_stream_open(aria_ctx *ctx, const aria_gen_params *base, const aria_stream_cfg *cfg);
 /* Generate the next chunk with `prompt` (NULL = uncond) and `steer` (borrowed for the
  * call, NULL = none). *audio points at the newly finalized interleaved frames (owned by

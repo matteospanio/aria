@@ -105,6 +105,13 @@ int main(void) {
     for (int i = 0; i < 5; i++)
         if (le.seeds[i] != want[i]) { printf("FAIL evolve seed[%d]=%lld\n", i, (long long)le.seeds[i]); fails++; }
 
+    acc r = {0}, r2 = {0}; fake_log lr = {0}, lr2 = {0};   /* seed -1 = a real random seed */
+    fails += run(2, 0, 0, 0, -1, &r, &lr);
+    fails += run(2, 0, 0, 0, -1, &r2, &lr2);
+    if (lr.seeds[0] < 0 || lr.seeds[1] != lr.seeds[0] || lr2.seeds[0] < 0 || lr2.seeds[0] == lr.seeds[0])
+        { printf("FAIL random seed (%lld, %lld)\n", (long long)lr.seeds[0], (long long)lr2.seeds[0]); fails++; }
+    free(r.buf); free(r2.buf);
+
     acc h = {0}; fake_log lh = {0};
     fails += run(5, 1, 0, 1, 3, &h, &lh);   /* hold: loop set at chunk 0, reset at the new prompt */
 

@@ -486,6 +486,8 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
     sc.evolve = evolve_n; sc.hold = hold;
     aria_stream *st = aria_stream_open(ctx, p, &sc);
     if (!st) { fprintf(stderr, "stream: %s\n", aria_last_error()); return 1; }
+    if (p->seed < 0) fprintf(stderr, "[stream] seed %lld (random; --seed %lld replays it)\n",
+                             (long long)aria_stream_seed(st), (long long)aria_stream_seed(st));
     int to_stdout = (strcmp(out_path, "-") == 0);   /* -o - : stream raw f32 to stdout for a player */
 #ifdef _WIN32
     if (to_stdout) _setmode(_fileno(stdout), _O_BINARY);   /* text mode would turn every 0x0A into CRLF */

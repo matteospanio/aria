@@ -115,6 +115,13 @@ aria_stream *aria_stream_open(aria_ctx *ctx, const aria_gen_params *base, const 
     s->outp = aria_audio_alloc(sr, ch, s->cap);
     if (!s->outp) { free(s); aria_set_error("stream: OOM"); return NULL; }
     s->seed = s->base_seed = base->seed;
+    if (s->seed < 0) {   /* -1 = random: draw one and report it (aria_stream_seed) so it can be replayed */
+        static unsigned opened;
+        uint64_t x = (uint64_t)time(NULL) ^ ((uint64_t)clock() << 20) ^ (uint64_t)(uintptr_t)s ^ ((uint64_t)++opened << 40);
+        x += 0x9E3779B97F4A7C15ULL;   /* splitmix64 finalizer */
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL; x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL; x ^= x >> 31;
+        s->seed = s->base_seed = (int64_t)(x & 0x7fffffff);
+    }
     return s;
 }
 
