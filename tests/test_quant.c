@@ -138,6 +138,38 @@ int main(void) {
         check_le("w8a8 gemm+bias relerr", gemm_relerr(yq, yref, Mb * N), 0.06f);
     }
 
+    /* W8A8 must be exact int32 math on every path (scalar, AVX2 maddubs, AVX-VNNI,
+     * NEON sdot): bit-identical to a scalar reference with the same quantization.
+     * The shapes cover full and edge register tiles and a K tail. */
+    {
+        static const int shp[][3] = { {1, 32, 1}, {3, 64, 2}, {4, 96, 3}, {5, 100, 4}, {7, 1030, 7}, {9, 1024, 13}, {12, 256, 6} };
+        int bad = 0;
+        for (size_t si = 0; si < sizeof shp / sizeof *shp; si++) {
+            int M = shp[si][0], K = shp[si][1], N = shp[si][2];
+            float *W = malloc((size_t)N * K * sizeof(float)), *x = malloc((size_t)M * K * sizeof(float));
+            float *b = malloc((size_t)N * sizeof(float)), *y = malloc((size_t)M * N * sizeof(float));
+            int8_t *q = malloc((size_t)N * K), *xq = malloc((size_t)M * K); float *scale = malloc((size_t)N * sizeof(float));
+            for (int i = 0; i < N * K; i++) W[i] = 0.1f * frandn();
+            for (int i = 0; i < M * K; i++) x[i] = frandn();
+            for (int i = 0; i < N; i++) b[i] = frandn();
+            aria_q8_quant(q, scale, W, N, K);
+            aria_linear_q8a8(y, x, q, scale, b, M, K, N);
+            for (int m = 0; m < M && !bad; m++) {
+                float amax = 0; for (int k = 0; k < K; k++) if (fabsf(x[m * K + k]) > amax) amax = fabsf(x[m * K + k]);
+                float sx = amax / 127.0f, inv = 127.0f / amax;
+                for (int k = 0; k < K; k++) { int v = (int)lrintf(x[m * K + k] * inv); xq[m * K + k] = (int8_t)(v < -127 ? -127 : v > 127 ? 127 : v); }
+                for (int n = 0; n < N; n++) {
+                    int32_t acc = 0;
+                    for (int k = 0; k < K; k++) acc += (int32_t)xq[m * K + k] * q[(size_t)n * K + k];
+                    float r = (float)acc * sx * scale[n] + b[n];
+                    if (memcmp(&r, &y[m * N + n], sizeof r)) { printf("FAIL w8a8 exact M=%d K=%d N=%d at (%d,%d)\n", M, K, N, m, n); bad = 1; break; }
+                }
+            }
+            free(W); free(x); free(b); free(y); free(q); free(xq); free(scale);
+        }
+        if (bad) fails++; else printf("ok   w8a8 exact int32 (bit-identical to the scalar reference)\n");
+    }
+
     /* E9.2: aria_qweight serialization round-trip must be bit-identical */
     for (int qi = 0; qi < 2; qi++) {
         aria_dtype dt = qi ? ARIA_Q4 : ARIA_Q8;

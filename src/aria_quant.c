@@ -159,9 +159,92 @@ static int8_t *q8a8_tls(size_t need) {
     return buf;
 }
 
+#if defined(__AVX2__) && (defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__)))
+/* AVX-VNNI: vpdpbusd multiplies unsigned x signed bytes and adds groups of 4 straight
+ * into int32. Activations become unsigned by +128 (xu = x ^ 0x80) and the extra
+ * 128 * sum(w) is subtracted per column, so every output is the same exact int32 as the
+ * scalar / maddubs / sdot paths (bit-identical) -- with 4x the multiply-adds per
+ * instruction and a register-blocked 4x3 tile: each weight vector loaded once feeds 4
+ * activation rows. Threads split the columns, so each streams its weights once while
+ * the int8 activations stay in cache. */
+#define ARIA_VNNI 1
+#if defined(__AVXVNNI__)
+#define DPBUSD(acc, u, s) _mm256_dpbusd_avx_epi32((acc), (u), (s))
+#else
+#define DPBUSD(acc, u, s) _mm256_dpbusd_epi32((acc), (u), (s))
+#endif
+#define VMR 4   /* activation rows per tile */
+#define VNR 3   /* weight rows (output columns) per tile */
+
+static void q8a8_vnni(float *y, const uint8_t *xu, const float *sx, const int8_t *q,
+                      const float *scale, const float *b, int M, int K, int N, int32_t *cs) {
+    const int K32 = K & ~31;
+    int nb = (N + VNR - 1) / VNR;
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic, 2)
+    #endif
+    for (int j = 0; j < nb; j++) {
+        int n0 = j * VNR, nr = N - n0 < VNR ? N - n0 : VNR;
+        for (int n = n0; n < n0 + nr; n++) {   /* 128 * sum(w) over the vector part */
+            int32_t sum = 0; const int8_t *qn = q + (size_t)n * K;
+            for (int k = 0; k < K32; k++) sum += qn[k];
+            cs[n] = 128 * sum;
+        }
+        for (int m0 = 0; m0 < M; m0 += VMR) {
+            int mr = M - m0 < VMR ? M - m0 : VMR;
+            int32_t acc[VMR][VNR];
+            if (mr == VMR && nr == VNR) {
+                const int8_t *q0 = q + (size_t)n0 * K, *q1 = q0 + K, *q2 = q1 + K;
+                const uint8_t *x0 = xu + (size_t)m0 * K, *x1 = x0 + K, *x2 = x1 + K, *x3 = x2 + K;
+                __m256i a00 = _mm256_setzero_si256(), a01 = a00, a02 = a00, a10 = a00, a11 = a00, a12 = a00;
+                __m256i a20 = a00, a21 = a00, a22 = a00, a30 = a00, a31 = a00, a32 = a00;
+                for (int k = 0; k < K32; k += 32) {
+                    __m256i w0 = _mm256_loadu_si256((const __m256i *)(q0 + k));
+                    __m256i w1 = _mm256_loadu_si256((const __m256i *)(q1 + k));
+                    __m256i w2 = _mm256_loadu_si256((const __m256i *)(q2 + k));
+                    __m256i v = _mm256_loadu_si256((const __m256i *)(x0 + k));
+                    a00 = DPBUSD(a00, v, w0); a01 = DPBUSD(a01, v, w1); a02 = DPBUSD(a02, v, w2);
+                    v = _mm256_loadu_si256((const __m256i *)(x1 + k));
+                    a10 = DPBUSD(a10, v, w0); a11 = DPBUSD(a11, v, w1); a12 = DPBUSD(a12, v, w2);
+                    v = _mm256_loadu_si256((const __m256i *)(x2 + k));
+                    a20 = DPBUSD(a20, v, w0); a21 = DPBUSD(a21, v, w1); a22 = DPBUSD(a22, v, w2);
+                    v = _mm256_loadu_si256((const __m256i *)(x3 + k));
+                    a30 = DPBUSD(a30, v, w0); a31 = DPBUSD(a31, v, w1); a32 = DPBUSD(a32, v, w2);
+                }
+                acc[0][0] = aria_avx2_hsum_i32(a00); acc[0][1] = aria_avx2_hsum_i32(a01); acc[0][2] = aria_avx2_hsum_i32(a02);
+                acc[1][0] = aria_avx2_hsum_i32(a10); acc[1][1] = aria_avx2_hsum_i32(a11); acc[1][2] = aria_avx2_hsum_i32(a12);
+                acc[2][0] = aria_avx2_hsum_i32(a20); acc[2][1] = aria_avx2_hsum_i32(a21); acc[2][2] = aria_avx2_hsum_i32(a22);
+                acc[3][0] = aria_avx2_hsum_i32(a30); acc[3][1] = aria_avx2_hsum_i32(a31); acc[3][2] = aria_avx2_hsum_i32(a32);
+            } else {   /* edge tile: one (m, n) pair at a time */
+                for (int mi = 0; mi < mr; mi++)
+                    for (int ni = 0; ni < nr; ni++) {
+                        const int8_t *qn = q + (size_t)(n0 + ni) * K;
+                        const uint8_t *xr = xu + (size_t)(m0 + mi) * K;
+                        __m256i a = _mm256_setzero_si256();
+                        for (int k = 0; k < K32; k += 32)
+                            a = DPBUSD(a, _mm256_loadu_si256((const __m256i *)(xr + k)), _mm256_loadu_si256((const __m256i *)(qn + k)));
+                        acc[mi][ni] = aria_avx2_hsum_i32(a);
+                    }
+            }
+            for (int mi = 0; mi < mr; mi++) {
+                int m = m0 + mi;
+                const uint8_t *xr = xu + (size_t)m * K;
+                for (int ni = 0; ni < nr; ni++) {
+                    int n = n0 + ni;
+                    const int8_t *qn = q + (size_t)n * K;
+                    int32_t a = acc[mi][ni] - cs[n];
+                    for (int k = K32; k < K; k++) a += ((int32_t)xr[k] - 128) * qn[k];   /* tail, signed */
+                    y[(size_t)m * N + n] = (float)a * sx[m] * scale[n] + (b ? b[n] : 0.0f);
+                }
+            }
+        }
+    }
+}
+#endif
+
 void aria_linear_q8a8(float *y, const float *x, const int8_t *q, const float *scale,
                       const float *b, int M, int K, int N) {
-    int8_t *xq = q8a8_tls((size_t)M * K + (size_t)M * sizeof(float) + 64);
+    int8_t *xq = q8a8_tls((size_t)M * K + (size_t)M * sizeof(float) + 64 + (size_t)N * sizeof(int32_t) + 64);
     float *sx = (float *)(void *)(xq + (((size_t)M * K + 63) & ~(size_t)63));
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
@@ -179,6 +262,15 @@ void aria_linear_q8a8(float *y, const float *x, const int8_t *q, const float *sc
             memset(qr, 0, (size_t)K);
         }
     }
+#ifdef ARIA_VNNI
+    {
+        int32_t *cs = (int32_t *)(void *)((char *)sx + (((size_t)M * sizeof(float) + 63) & ~(size_t)63));
+        uint8_t *xu = (uint8_t *)xq;   /* x + 128: flip the sign bit in place */
+        for (size_t i = 0; i < (size_t)M * K; i++) xu[i] ^= 0x80;
+        q8a8_vnni(y, xu, sx, q, scale, b, M, K, N, cs);
+        return;
+    }
+#endif
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
     #endif
