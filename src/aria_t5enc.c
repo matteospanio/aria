@@ -22,9 +22,11 @@
 
 typedef struct {
     const float *pre_attn_norm, *post_attn_norm, *pre_ff_norm, *post_ff_norm; /* [768] */
-    const float *wq, *wk, *wv, *wo;   /* [768,768] */
-    const float *w_gate, *w_up;       /* [2048,768] */
-    const float *w_down;              /* [768,2048] */
+    /* projections: BF16 borrowed from the mmap, widened to f32 while packing (the same
+     * <<16 the f32 copy did; every projection takes the packed path) */
+    const uint16_t *wq, *wk, *wv, *wo;   /* [768,768] */
+    const uint16_t *w_gate, *w_up;       /* [2048,768] */
+    const uint16_t *w_down;              /* [768,2048] */
 } t5_layer;
 
 struct aria_t5enc {
@@ -55,96 +57,102 @@ static void merge_heads(float *dst, const float *src, int seq, int H, int hd) {
             memcpy(dst + (size_t)s * H * hd + (size_t)h * hd, src + ((size_t)h * seq + s) * hd,
                    (size_t)hd * sizeof(float));
 }
+static void lin_bf16(float *y, const float *x, const uint16_t *W, int M, int K, int N) {
+    aria_linear_hw(y, x, W, 1, NULL, M, K, N);
+}
 
 void aria_t5enc_encode(const aria_t5enc *e, float *cond, const int *ids, int seq, int n_real) {
     const int D = T5_D, H = T5_H, hd = T5_HD, I = T5_I;
     float normalizer = sqrtf((float)D);
+    /* Only the n_real real tokens are computed: padded keys were masked to exact zero
+     * weight and padded outputs are overwritten by the learned padding embedding, so the
+     * real rows are byte-identical to the masked full-length pass (the per-head score
+     * GEMM is pinned to the packed kernel, whose per-element math is size-independent). */
+    const int n = n_real < seq ? n_real : seq;
+    if (n <= 0) {
+        for (int p = 0; p < seq; p++) memcpy(cond + (size_t)p * D, e->padding_embedding, (size_t)D * sizeof(float));
+        return;
+    }
 
     /* one per-request scratch arena (allocate-once: every buffer lives the whole
      * forward, so no save/restore -- just bump-allocate and free at the end). */
     aria_arena arena;
-    size_t fl = 9 * (size_t)seq * D + 2 * (size_t)seq * seq + 2 * (size_t)seq * I
-                + (size_t)seq * T5_ROT + 4096;
+    size_t fl = 9 * (size_t)n * D + (size_t)H * n * n + 2 * (size_t)n * I + (size_t)n * T5_ROT + 4096;
     aria_arena_init(&arena, fl * sizeof(float));
     aria_arena *ar = &arena;
 
-    float *h = aria_arena_floats(ar, (size_t)seq * D);
-    for (int p = 0; p < seq; p++) {
+    float *h = aria_arena_floats(ar, (size_t)n * D);
+    for (int p = 0; p < n; p++) {
         const uint16_t *row = e->embed_bf16 + (size_t)ids[p] * D;
         float *hr = h + (size_t)p * D;
         for (int j = 0; j < D; j++) hr[j] = bf16_to_f32(row[j]) * normalizer;
     }
 
-    float *rcos = aria_arena_floats(ar, (size_t)seq * (T5_ROT / 2));
-    float *rsin = aria_arena_floats(ar, (size_t)seq * (T5_ROT / 2));
-    aria_rope_freqs(rcos, rsin, seq, T5_ROT, 10000.0f);
+    float *rcos = aria_arena_floats(ar, (size_t)n * (T5_ROT / 2));
+    float *rsin = aria_arena_floats(ar, (size_t)n * (T5_ROT / 2));
+    aria_rope_freqs(rcos, rsin, n, T5_ROT, 10000.0f);
 
-    /* padding mask bias [seq,seq] (per key, broadcast over queries) */
-    float *maskmat = NULL;
-    if (n_real < seq) {
-        maskmat = aria_arena_floats(ar, (size_t)seq * seq);
-        for (int q = 0; q < seq; q++)
-            for (int k = 0; k < seq; k++)
-                maskmat[(size_t)q * seq + k] = (k < n_real) ? 0.0f : -3.4e38f;
-    }
-
-    float *res = aria_arena_floats(ar, (size_t)seq * D);
-    float *a = aria_arena_floats(ar, (size_t)seq * D);
-    float *proj = aria_arena_floats(ar, (size_t)seq * D);
-    float *qh = aria_arena_floats(ar, (size_t)H * seq * hd);
-    float *kh = aria_arena_floats(ar, (size_t)H * seq * hd);
-    float *vh = aria_arena_floats(ar, (size_t)H * seq * hd);
-    float *oh = aria_arena_floats(ar, (size_t)H * seq * hd);
-    float *merged = aria_arena_floats(ar, (size_t)seq * D);
-    float *scores = aria_arena_floats(ar, (size_t)seq * seq);
-    float *gate = aria_arena_floats(ar, (size_t)seq * I);
-    float *up = aria_arena_floats(ar, (size_t)seq * I);
+    float *res = aria_arena_floats(ar, (size_t)n * D);
+    float *a = aria_arena_floats(ar, (size_t)n * D);
+    float *proj = aria_arena_floats(ar, (size_t)n * D);
+    float *qh = aria_arena_floats(ar, (size_t)H * n * hd);
+    float *kh = aria_arena_floats(ar, (size_t)H * n * hd);
+    float *vh = aria_arena_floats(ar, (size_t)H * n * hd);
+    float *oh = aria_arena_floats(ar, (size_t)H * n * hd);
+    float *merged = aria_arena_floats(ar, (size_t)n * D);
+    float *scores = aria_arena_floats(ar, (size_t)H * n * n);   /* one tile per head */
+    float *gate = aria_arena_floats(ar, (size_t)n * I);
+    float *up = aria_arena_floats(ar, (size_t)n * I);
 
     for (int li = 0; li < T5_L; li++) {
         const t5_layer *L = &e->layers[li];
 
         /* ---- self-attention (sandwich norm) ---- */
-        memcpy(res, h, (size_t)seq * D * sizeof(float));
-        aria_gemma_rmsnorm(a, h, L->pre_attn_norm, seq, D, T5_EPS);
-        aria_linear(proj, a, L->wq, NULL, seq, D, D); extract_heads(qh, proj, seq, H, hd);
-        aria_linear(proj, a, L->wk, NULL, seq, D, D); extract_heads(kh, proj, seq, H, hd);
-        aria_linear(proj, a, L->wv, NULL, seq, D, D); extract_heads(vh, proj, seq, H, hd);
-        aria_rope_apply(qh, rcos, rsin, H, seq, hd, T5_ROT);
-        aria_rope_apply(kh, rcos, rsin, H, seq, hd, T5_ROT);
-        for (int hi = 0; hi < H; hi++) {
-            const float *qhh = qh + (size_t)hi * seq * hd;
-            const float *khh = kh + (size_t)hi * seq * hd;
-            const float *vhh = vh + (size_t)hi * seq * hd;
-            float *ohh = oh + (size_t)hi * seq * hd;
-            aria_linear(scores, qhh, khh, NULL, seq, hd, seq);   /* q @ k^T */
-            for (size_t i = 0; i < (size_t)seq * seq; i++) scores[i] *= T5_SCALE;
-            aria_softcap(scores, seq * seq, T5_SOFTCAP);
-            aria_softmax_inplace(scores, seq, seq, maskmat);
-            aria_matmul(ohh, scores, vhh, seq, seq, hd);
+        memcpy(res, h, (size_t)n * D * sizeof(float));
+        aria_gemma_rmsnorm(a, h, L->pre_attn_norm, n, D, T5_EPS);
+        lin_bf16(proj, a, L->wq, n, D, D); extract_heads(qh, proj, n, H, hd);
+        lin_bf16(proj, a, L->wk, n, D, D); extract_heads(kh, proj, n, H, hd);
+        lin_bf16(proj, a, L->wv, n, D, D); extract_heads(vh, proj, n, H, hd);
+        aria_rope_apply(qh, rcos, rsin, H, n, hd, T5_ROT);
+        aria_rope_apply(kh, rcos, rsin, H, n, hd, T5_ROT);
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (int hi = 0; hi < H; hi++) {   /* heads in parallel; inner ops run nested */
+            const float *qhh = qh + (size_t)hi * n * hd;
+            const float *khh = kh + (size_t)hi * n * hd;
+            const float *vhh = vh + (size_t)hi * n * hd;
+            float *ohh = oh + (size_t)hi * n * hd;
+            float *sc = scores + (size_t)hi * n * n;
+            aria_linear_packed_only(sc, qhh, khh, NULL, n, hd, n);   /* q @ k^T */
+            for (size_t i = 0; i < (size_t)n * n; i++) sc[i] *= T5_SCALE;
+            aria_softcap(sc, n * n, T5_SOFTCAP);
+            aria_softmax_inplace(sc, n, n, NULL);
+            aria_matmul(ohh, sc, vhh, n, n, hd);
         }
-        merge_heads(merged, oh, seq, H, hd);
-        aria_linear(a, merged, L->wo, NULL, seq, D, D);
-        aria_gemma_rmsnorm(a, a, L->post_attn_norm, seq, D, T5_EPS);   /* on attn output */
-        for (size_t i = 0; i < (size_t)seq * D; i++) h[i] = res[i] + a[i];
+        merge_heads(merged, oh, n, H, hd);
+        lin_bf16(a, merged, L->wo, n, D, D);
+        aria_gemma_rmsnorm(a, a, L->post_attn_norm, n, D, T5_EPS);   /* on attn output */
+        for (size_t i = 0; i < (size_t)n * D; i++) h[i] = res[i] + a[i];
 
         /* ---- GeGLU feed-forward (sandwich norm) ---- */
-        memcpy(res, h, (size_t)seq * D * sizeof(float));
-        aria_gemma_rmsnorm(a, h, L->pre_ff_norm, seq, D, T5_EPS);
-        aria_linear(gate, a, L->w_gate, NULL, seq, D, I);
-        aria_linear(up, a, L->w_up, NULL, seq, D, I);
-        aria_gelu_tanh(gate, seq * I);
-        for (size_t i = 0; i < (size_t)seq * I; i++) gate[i] *= up[i];
-        aria_linear(a, gate, L->w_down, NULL, seq, I, D);
-        aria_gemma_rmsnorm(a, a, L->post_ff_norm, seq, D, T5_EPS);     /* on mlp output */
-        for (size_t i = 0; i < (size_t)seq * D; i++) h[i] = res[i] + a[i];
+        memcpy(res, h, (size_t)n * D * sizeof(float));
+        aria_gemma_rmsnorm(a, h, L->pre_ff_norm, n, D, T5_EPS);
+        lin_bf16(gate, a, L->w_gate, n, D, I);
+        lin_bf16(up, a, L->w_up, n, D, I);
+        aria_gelu_tanh(gate, n * I);
+        for (size_t i = 0; i < (size_t)n * I; i++) gate[i] *= up[i];
+        lin_bf16(a, gate, L->w_down, n, I, D);
+        aria_gemma_rmsnorm(a, a, L->post_ff_norm, n, D, T5_EPS);     /* on mlp output */
+        for (size_t i = 0; i < (size_t)n * D; i++) h[i] = res[i] + a[i];
     }
 
-    aria_gemma_rmsnorm(h, h, e->final_norm, seq, D, T5_EPS);
+    aria_gemma_rmsnorm(h, h, e->final_norm, n, D, T5_EPS);
 
     /* learned-padding overwrite */
     for (int p = 0; p < seq; p++) {
-        if (p < n_real) memcpy(cond + (size_t)p * D, h + (size_t)p * D, (size_t)D * sizeof(float));
-        else            memcpy(cond + (size_t)p * D, e->padding_embedding, (size_t)D * sizeof(float));
+        if (p < n) memcpy(cond + (size_t)p * D, h + (size_t)p * D, (size_t)D * sizeof(float));
+        else       memcpy(cond + (size_t)p * D, e->padding_embedding, (size_t)D * sizeof(float));
     }
 
     aria_arena_free(&arena);
@@ -162,6 +170,13 @@ static const float *track(aria_t5enc *e, safetensors_file_t *sf, const char *nam
     }
     e->owned[e->n_owned++] = p;
     return p;
+}
+static const uint16_t *track_bf16(aria_t5enc *e, safetensors_file_t *sf, const char *name) {
+    const safetensor_t *t = safetensors_find(sf, name);
+    if (!t || t->dtype != DTYPE_BF16) {
+        fprintf(stderr, "aria_t5enc_load: %s missing or not BF16\n", name); e->failed = 1; return NULL;
+    }
+    return (const uint16_t *)safetensors_data(sf, t);   /* borrowed from the mmap */
 }
 
 aria_t5enc *aria_t5enc_load(const char *model_dir, const char *subfolder,
@@ -188,18 +203,20 @@ aria_t5enc *aria_t5enc_load(const char *model_dir, const char *subfolder,
     for (int i = 0; i < T5_L; i++) {
         t5_layer *L = &e->layers[i];
         #define G(dst, suf) do { snprintf(nm, sizeof(nm), P suf, i); dst = track(e, e->t5sf, nm); } while (0)
+        #define W(dst, suf) do { snprintf(nm, sizeof(nm), P suf, i); dst = track_bf16(e, e->t5sf, nm); } while (0)
         G(L->pre_attn_norm, "pre_self_attn_layernorm.weight");
-        G(L->wq, "self_attn.q_proj.weight");
-        G(L->wk, "self_attn.k_proj.weight");
-        G(L->wv, "self_attn.v_proj.weight");
-        G(L->wo, "self_attn.o_proj.weight");
+        W(L->wq, "self_attn.q_proj.weight");
+        W(L->wk, "self_attn.k_proj.weight");
+        W(L->wv, "self_attn.v_proj.weight");
+        W(L->wo, "self_attn.o_proj.weight");
         G(L->post_attn_norm, "post_self_attn_layernorm.weight");
         G(L->pre_ff_norm, "pre_feedforward_layernorm.weight");
-        G(L->w_gate, "mlp.gate_proj.weight");
-        G(L->w_up, "mlp.up_proj.weight");
-        G(L->w_down, "mlp.down_proj.weight");
+        W(L->w_gate, "mlp.gate_proj.weight");
+        W(L->w_up, "mlp.up_proj.weight");
+        W(L->w_down, "mlp.down_proj.weight");
         G(L->post_ff_norm, "post_feedforward_layernorm.weight");
         #undef G
+        #undef W
     }
     #undef P
 

@@ -38,6 +38,16 @@ void aria_sa3_softnorm_decode(const aria_sa3_dec *m, float *z, const float *late
     for (size_t i = 0; i < (size_t)256 * T; i++) z[i] = latent[i] * m->running_std;
 }
 
+void aria_unpatch_stereo_tm(float *audio, const float *dec_tm, int L) {
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int l = 0; l < L; l++)   /* row l = [ch0 patch (256) | ch1 patch (256)] */
+        for (int c = 0; c < 2; c++)
+            memcpy(audio + (size_t)c * L * 256 + (size_t)l * 256, dec_tm + (size_t)l * 512 + c * 256,
+                   256 * sizeof(float));
+}
+
 void aria_unpatch_stereo(float *audio, const float *dec, int L) {
     for (int c = 0; c < 2; c++)
         for (int l = 0; l < L; l++)
@@ -71,35 +81,37 @@ void aria_sa3_same_decode(const aria_sa3_dec *m, float *dec, const float *z, int
     float rcos[DEC_S * (DEC_ROT / 2)], rsin[DEC_S * (DEC_ROT / 2)];
     aria_rope_freqs(rcos, rsin, DEC_S, DEC_ROT, 10000.0f);
 
-    int nth = 1;
-    #ifdef _OPENMP
-    nth = omp_get_max_threads();
-    #endif
-    aria_arena *arenas = malloc((size_t)nth * sizeof(aria_arena));
-    for (int i = 0; i < nth; i++) aria_arena_init(&arenas[i], taae_block_arena_bytes());
-    taae_chunk_pass(seq, L, &m->blocks[0], rcos, rsin, 0, arenas);  /* blocks 0,1,2 */
-    taae_chunk_pass(seq, L, &m->blocks[3], rcos, rsin, 1, arenas);  /* blocks 3,4,5 midpoint-shift */
-    for (int i = 0; i < nth; i++) aria_arena_free(&arenas[i]);
-    free(arenas);
+    taae_chunk_pass(seq, L, &m->blocks[0], rcos, rsin, 0);  /* blocks 0,1,2 */
+    taae_chunk_pass(seq, L, &m->blocks[3], rcos, rsin, 1);  /* blocks 3,4,5 midpoint-shift */
 
-    /* extract last 16 of each 17-group -> feat[768, Tp*16] */
+    /* WNConv1d mapping 768 -> 512 (k3 p1) over the last 16 of each 17-group, as one GEMM:
+     * im2col row t = [x(t-1)[i], x(t)[i], x(t+1)[i]] interleaved per channel i (zero past
+     * the edges), which is exactly the folded weight's [512][768][3] layout. */
     int Lout = Tp * 16;
-    float *feat = malloc((size_t)D * Lout * sizeof(float));
-    for (int t = 0; t < Tp; t++)
-        for (int j = 0; j < 16; j++)
-            for (int d = 0; d < D; d++)
-                feat[(size_t)d * Lout + (size_t)t * 16 + j] = seq[(size_t)(t * 17 + 1 + j) * D + d];
+    float *xcat = malloc((size_t)Lout * 3 * D * sizeof(float));
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int t = 0; t < Lout; t++) {
+        float *xr = xcat + (size_t)t * 3 * D;
+        for (int k = 0; k < 3; k++) {
+            int tt = t + k - 1;
+            const float *src = (tt >= 0 && tt < Lout) ? seq + (size_t)((tt / 16) * 17 + 1 + tt % 16) * D : NULL;
+            for (int i = 0; i < D; i++) xr[i * 3 + k] = src ? src[i] : 0.0f;
+        }
+    }
     free(seq);
+    float *mapped = malloc((size_t)Lout * DEC_OUT * sizeof(float));   /* [Lout, 512] token-major */
+    aria_linear(mapped, xcat, m->mapping_w, m->mapping_b, Lout, 3 * D, DEC_OUT);
+    free(xcat);
 
-    /* WNConv1d mapping 768 -> 512, k3 p1 */
-    float *mapped = malloc((size_t)DEC_OUT * Lout * sizeof(float));
-    aria_conv1d(mapped, feat, m->mapping_w, m->mapping_b, D, DEC_OUT, 3, 1, Lout);
-    free(feat);
-
-    /* trim to T*16 */
+    /* trim to T*16 and transpose to dec[512, T*16] */
     int Lt = T * 16;
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (int c = 0; c < DEC_OUT; c++)
-        memcpy(dec + (size_t)c * Lt, mapped + (size_t)c * Lout, (size_t)Lt * sizeof(float));
+        for (int l = 0; l < Lt; l++) dec[(size_t)c * Lt + l] = mapped[(size_t)l * DEC_OUT + c];
     free(mapped);
 }
 
@@ -139,11 +151,21 @@ void aria_sa3_dec_forward(const aria_sa3_dec *m, float *out_audio, const float *
  * Peak arena is O(window): seq/feat/mapped/audio-slice all size to B-A, not T. */
 #define DEC_WIN_HALO 2   /* latent frames; see derivation above */
 
+int aria_sa3_dec_window_for_budget(size_t budget_bytes) {
+    /* per decoded frame: seq + shift-pass copy (17 tokens) + mapping im2col + mapped + audio;
+     * the chunk-pass arena is fixed-size (one group of chunks), not per-frame */
+    size_t per_frame = (size_t)(2 * 17 * DEC_D + 16 * 3 * DEC_D + 16 * DEC_OUT + 2 * 4096) * sizeof(float);
+    long w = (long)(budget_bytes / per_frame) - 2 * DEC_WIN_HALO - 2;
+    return w > 86 ? (int)(w > 1 << 20 ? 1 << 20 : w) : 86;   /* never under ~8 s */
+}
+
 void aria_sa3_dec_forward_windowed(const aria_sa3_dec *m, float *out_audio,
                                    const float *latent, int T, int window_frames) {
     int W = window_frames > 0 ? window_frames : 86;   /* ~8 s at 44.1 kHz / 4096 */
     const int H = DEC_WIN_HALO;
     int maxwf = W + 2 * H + 2;                          /* upper bound on slice frames */
+    /* one slice would cover the clip: decode it whole -- same bytes, same peak */
+    if (T <= maxwf) { aria_sa3_dec_forward(m, out_audio, latent, T); return; }
     float *lat_slice = malloc((size_t)256 * maxwf * sizeof(float));
     float *aud_slice = malloc((size_t)2 * maxwf * 4096 * sizeof(float));
     for (int start = 0; start < T; start += W) {
@@ -193,9 +215,8 @@ void aria_sa3_dec_block_test(const aria_sa3_dec *m, int idx, float *xc, int N) {
     float *rsin = malloc((size_t)N * (DEC_ROT / 2) * sizeof(float));
     aria_rope_freqs(rcos, rsin, N, DEC_ROT, 10000.0f);
     aria_arena ar;
-    size_t fl = 12 * (size_t)N * DEC_D + (size_t)N * TAAE_QKV + (size_t)N * N + 3 * (size_t)N * TAAE_INNER + 4096;
-    aria_arena_init(&ar, fl * sizeof(float));
-    taae_block_forward(xc, N, &m->blocks[idx], rcos, rsin, &ar);
+    aria_arena_init(&ar, taae_block_arena_bytes(N));
+    taae_block_forward(xc, 1, N, &m->blocks[idx], rcos, rsin, &ar);
     aria_arena_free(&ar);
     free(rcos); free(rsin);
 }

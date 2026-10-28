@@ -93,16 +93,8 @@ void aria_sa3_same_encode(const aria_sa3_enc *m, float *enc, const float *patche
     /* 5. two chunked (S=34) transformer passes: blocks 0-2 unshifted, 3-5 shifted */
     float rcos[TAAE_S * (TAAE_ROT / 2)], rsin[TAAE_S * (TAAE_ROT / 2)];
     aria_rope_freqs(rcos, rsin, TAAE_S, TAAE_ROT, 10000.0f);
-    int nth = 1;
-    #ifdef _OPENMP
-    nth = omp_get_max_threads();
-    #endif
-    aria_arena *arenas = malloc((size_t)nth * sizeof(aria_arena));
-    for (int i = 0; i < nth; i++) aria_arena_init(&arenas[i], taae_block_arena_bytes());
-    taae_chunk_pass(seq, L, &m->blocks[0], rcos, rsin, 0, arenas);
-    taae_chunk_pass(seq, L, &m->blocks[3], rcos, rsin, 1, arenas);
-    for (int i = 0; i < nth; i++) aria_arena_free(&arenas[i]);
-    free(arenas);
+    taae_chunk_pass(seq, L, &m->blocks[0], rcos, rsin, 0);
+    taae_chunk_pass(seq, L, &m->blocks[3], rcos, rsin, 1);
 
     /* 6. take the last token of each 17-group -> feat[G,768] (token-major) */
     float *feat = malloc((size_t)G * D * sizeof(float));
@@ -145,6 +137,14 @@ static float track_scalar(aria_sa3_enc *m, safetensors_file_t *sf, const char *n
 }
 
 aria_sa3_enc *aria_sa3_enc_load(safetensors_file_t *sf) {
+    /* only the 768-d SAME-S encoder is implemented; medium ships the 1536-d SAME-L one,
+     * whose tensors share these names -- reading them as 768-d would encode garbage */
+    const safetensor_t *nt = safetensors_find(sf, "pretransform.model.encoder.layers.0.new_tokens");
+    if (nt && nt->ndim >= 1 && nt->shape[nt->ndim - 1] != TAAE_D) {
+        fprintf(stderr, "aria_sa3_enc_load: encoder is %lld-d; only the %d-d SAME-S encoder is implemented\n",
+                (long long)nt->shape[nt->ndim - 1], TAAE_D);
+        return NULL;
+    }
     aria_sa3_enc *m = calloc(1, sizeof(*m));
     if (!m) return NULL;
 

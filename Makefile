@@ -133,7 +133,7 @@ aria-server: $(BUILD)/aria_server.o $(LIB)
 	$(CC) $(CFLAGS) -I$(SRC) $(BUILD)/aria_server.o -L$(BUILD) -laria $(LDFLAGS) -lpthread -o $@
 
 # ---- tests ----
-TESTS := test_ops test_wav test_config test_sampler test_arena test_quant test_rng test_lora
+TESTS := test_ops test_wav test_config test_sampler test_arena test_quant test_rng test_lora test_taae test_gemm
 test: $(LIB)
 	@set -e; \
 	for t in $(TESTS); do \

@@ -1,5 +1,97 @@
 # aria vs stable-audio-tools — benchmark
 
+## 2026-10 optimization round (byte-identical output)
+
+Same machine as below (i9-10900KF 20T + RTX 3070), `--uncond`, 8 steps; warm-min inside each
+process, median of 3 interleaved base/new rounds (the i9 drifts about ±8 % run to run). Every row's
+output is `cmp`-identical to the previous build (CPU and GPU, both models, 10 s and 60 s, with and
+without a prompt; also fp16 storage, W8A8, `--continue`, `--stream`, steering, `ARIA_NO_GRAPH`, and
+1 thread vs default). The decoder mapping conv-as-GEMM is the one fp32 reordering (rel_rmse ≤ 2.1e-7).
+
+| config | before | after | total (DiT / decode) after |
+|---|---|---|---|
+| CPU small 10 s | 2.61 s | **2.08 s** (−20 %) | 1.69 / 0.37 |
+| CPU small 60 s | 12.29 s | **9.59 s** (−22 %) | 7.46 / 2.10 |
+| CPU medium 10 s | 10.03 s | **7.84 s** (−22 %) | 5.36 / 2.37 |
+| GPU small 10 s | 0.13 s | **0.10 s** (−23 %) | 0.09 / 0.01 |
+| GPU small 60 s | 0.49 s | **0.37 s** (−24 %) | 0.30 / 0.06 |
+| GPU medium 10 s | 0.34 s | **0.29 s** (−15 %) | 0.22 / 0.07 |
+| GPU medium 60 s | 1.26 s | **1.14 s** (−10 %) | 0.78 / 0.36 |
+
+One-shot GPU CLI with a text prompt (process start to WAV, warm page cache): small 10 s
+1.36 → **0.72 s**, medium 10 s 2.77 → **1.78 s** — T5Gemma now runs only the prompt's real tokens
+(0.2–0.35 s → 0.05 s) and weights upload as host-converted fp16. What remains is mostly the upload
+(`weights=` 0.30 s small / 0.84 s medium).
+
+Where it came from:
+- **Threads:** one OpenMP thread per physical core. HT siblings only contend for the FMA ports
+  the GEMMs saturate: the DiT is ~5–10 % faster at 10 threads than 20 on the i9, and decode too.
+- **Small decoder:** the per-token GEMMs (qkv/out/FF) run over 32-chunk groups (M = 1088) instead of
+  one 34-token chunk each, so every block's weights stream once per group, not once per chunk:
+  CPU decode −40 %.
+- **Medium decoder:** the serial glue (GLU `sinf`/`expf`, RoPE, residuals) is parallel; banded attention
+  splits over (head × 64-query block) and vectorizes the q·k dot 8 keys at a time with the same
+  mul-then-add rounding; decode windows grow to what 1/32 of RAM holds (a 10 s medium clip no longer
+  decodes 132 frames for 108).
+- **GEMM:** A packs in parallel; packed-A ≥ 8 MB takes a cache-blocked driver (KC/MC from `sysconf`).
+  Measured on the real model, the default dispatch beats both "always panels" and "always blocked"
+  (small 60 s DiT 7.48 vs 7.6 vs 8.2 s); the blocked driver only wins on large-K, large-M GEMMs
+  (medium decoder FF-out 410 → 589 GFLOP/s). The CLI sets `OMP_WAIT_POLICY=active`; without it the
+  panels driver was erratic in a standalone microbenchmark. `aria-server` and libaria programs don't
+  set it (active waiting also keeps idle cores spinning) — export it for CPU-heavy resident use.
+- **GPU:** the pingpong loop runs on the device (gcond precomputed, noise drawn on the host into
+  pinned buffers while the DiT runs, `__fmul_rn` pingpong kernel); warp-per-row softmax that
+  reproduces the 256-thread tree's pairing; differential subtract fused into the head merge; the small
+  decoder's 34×34 chunk attention is one fused kernel (cuBLAS ran it as 128×128-tile SGEMMs) — and
+  it comes out bit-identical, since both are sequential-k FMA chains.
+- Tried and dropped: padding the DiT score rows to 8 for cuBLAS `align8` kernels — cuBLAS keeps the
+  `align1/2` kernels unless the key count itself is a multiple of 8.
+
+**Sampling schedule.** aria samples with LogSNR `rate=1` (length-dependent); `stable_audio_3`
+`generate()` uses `rate=0` (its wrapper default when the config has no sampling shift), and the
+stable-audio-3 TensorRT runtime uses the training `DistributionShift`. All three are now available
+via `--schedule ref|len|full` and parity-checked against the reference `build_schedule` (≤ 6e-8).
+A/B on the 3070 (12 prompts × 4 seeds × {10, 30, 60 s} × both models, CLAP prompt similarity +
+wav2taste): `ref` vs `len` ΔCLAP is within ±0.008 in every cell with every 95 % CI spanning 0, and
+wav2taste drift stays under the seed-noise floor — no measurable quality difference, while `ref`
+ends clips more naturally (last second 7–10 dB quieter at 10 s). The pre-registered non-inferiority
+margin (δ = ¼ seed-sd) was not met in 5 of 6 cells for lack of power, so the default stays `len`
+for now. `full` is significantly worse on medium 10 s (ΔCLAP −0.015); `--headroom 6` shows no gain.
+
+### New defaults (output-changing, A/B-gated)
+
+A speed setting that changes the output becomes a default only on hardware where it is faster *and*
+passes the same A/B against the exact default (12 prompts × 4 paired seeds per cell; pass = lower
+95 % bootstrap CI of ΔCLAP ≥ −¼ seed-sd and median wav2taste drift below the seed-noise floor):
+
+| knob | cells | ΔCLAP [95 % CI] range | wav2taste drift / seed noise | verdict |
+|---|---|---|---|---|
+| 6 steps (vs 8), GPU | small, medium × 10, 60 s | +0.002 … +0.008 (small 10 s CI > 0) | 0.053–0.068 / 0.112–0.143 | pass → default everywhere |
+| q8 + W8A8 (vs fp16), GPU | small, medium × 10, 60 s | −0.0014 … +0.0025 | 0.029–0.041 / 0.112–0.143 | pass → default on sm_75+ |
+| q8 + W8A8 (vs fp32), CPU | small, medium × 10 s | −0.002 … +0.003 | 0.033–0.040 / 0.136–0.143 | pass, but 1.3–1.4× **slower** on the i9 → not a default |
+| decoder q8 (vs fp32), CPU | small × 10 s | +0.0013 [−0.0018, +0.0044] | 0.004 / 0.136 | pass, but 1.2× **slower** on the i9 → not a default |
+
+The CPU int8 paths are slower on AVX2 without VNNI. On ARM with dotprod they were faster in
+earlier Pi sessions (see the Raspberry Pi table), but the fp32 path has moved since; they become
+the ARM default once a same-session Pi timing on the current build confirms it.
+
+Plain defaults, before (previous release: 8 steps, fp16 GPU / fp32 CPU) → after (6 steps, q8a8 on
+the GPU, fp32 on the CPU); same protocol as above, and peak VRAM sampled with `nvidia-smi` (whole
+GPU, ~330 MB idle included):
+
+| config | before | after | exact 6-step (`-s 6 --precision fp32`) | peak VRAM before → after |
+|---|---|---|---|---|
+| GPU small 10 s | 0.13 s | **0.06 s** | 0.08 s | 1679 → 1357 MB |
+| GPU small 60 s | 0.50 s | **0.25 s** | 0.30 s | 2575 → 2259 MB |
+| GPU medium 10 s | 0.34 s | **0.18 s** | 0.24 s | 4479 → 3417 MB |
+| GPU medium 60 s | 1.32 s | **0.85 s** | 0.96 s | 5735 → 4675 MB |
+| CPU small 10 s | 2.66 s | **1.65 s** | — | |
+| CPU small 60 s | 12.59 s | **7.74 s** | — | |
+| CPU medium 10 s | 10.21 s | **6.47 s** | — | |
+
+`-s 8 --precision fp32` reproduces the previous default (byte-identical on the GPU; on the CPU within
+the conv-as-GEMM rounding, rel_rmse ≤ 2.1e-7).
+
 aria (this runtime) vs **stable-audio-tools** (the PyTorch reference), same machine,
 same model weights, same workload: **uncond, 8-step pingpong, DiT + autoencoder
 decode** (no text encoder — isolates the core diffusion runtime). Both measure

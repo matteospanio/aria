@@ -65,6 +65,33 @@ int main(void) {
     eq_i("patch_size", c.patch_size, 256);
     if (fabsf(c.ff_mult - 4.0f) > 1e-6f) { printf("FAIL ff_mult: got %f\n", c.ff_mult); fails++; }
 
+    /* P0.1: no sampling key -> the stable_audio_3 wrapper default LogSNRShift(rate=0);
+     * the training shift must never leak into sampling */
+    eq_i("sample_shift.type", c.sample_shift.type, ARIA_SHIFT_LOGSNR);
+    if (c.sample_shift.rate != 0.0f) { printf("FAIL sample rate %f\n", c.sample_shift.rate); fails++; }
+    eq_i("train_shift.type", c.train_shift.type, ARIA_SHIFT_FULL);
+
+    /* explicit keys parse; "type" defaults to full; unknown types are an error */
+    const char *SH =
+        "{\"model\":{\"diffusion\":{"
+        " \"distribution_shift_options\": {\"min_length\": 128, \"max_length\": 2048},"
+        " \"sampling_distribution_shift_options\": {\"type\": \"logsnr\", \"rate\": 0.5},"
+        " \"config\": {\"io_channels\": 256, \"embed_dim\": 1024, \"depth\": 20, \"num_heads\": 16}}}}";
+    aria_sa3_config s;
+    if (aria_sa3_parse_config(SH, &s) != 0) { printf("FAIL: shift config parse\n"); return 1; }
+    eq_i("sampling.type", s.sample_shift.type, ARIA_SHIFT_LOGSNR);
+    if (s.sample_shift.rate != 0.5f || s.sample_shift.anchor_logsnr != -6.2f) {
+        printf("FAIL sampling params rate=%f anchor=%f\n", s.sample_shift.rate, s.sample_shift.anchor_logsnr); fails++;
+    }
+    eq_i("train.type", s.train_shift.type, ARIA_SHIFT_FULL);
+    if (s.train_shift.min_length != 128.0f || s.train_shift.max_length != 2048.0f || s.train_shift.max_shift != 1.15f) {
+        printf("FAIL train params\n"); fails++;
+    }
+    const char *BAD =
+        "{\"model\":{\"diffusion\":{\"sampling_distribution_shift_options\": {\"type\": \"cosine\"},"
+        " \"config\": {\"io_channels\": 256, \"embed_dim\": 1024, \"depth\": 20, \"num_heads\": 16}}}}";
+    if (aria_sa3_parse_config(BAD, &s) == 0) { printf("FAIL unknown shift type accepted\n"); fails++; }
+
     if (fails) { printf("test_config: %d failures\n", fails); return 1; }
     printf("test_config: OK\n");
     return 0;

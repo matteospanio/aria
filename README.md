@@ -11,11 +11,11 @@ It is CPU-first by design and runs on ordinary laptops, on old and cheap NVIDIA 
 
 - **text → audio** — GemmaTokenizer BPE → T5Gemma text encoder → DiT denoiser over a LogSNR pingpong sampler → taae_v2 decoder → stereo WAV.
 - **continue / inpaint** — extend a clip (`--continue`) or regenerate a region (`--inpaint --from --to`); kept regions are preserved bit-for-bit.
-- **quantization** — `--precision fp32|q8|q4`. On the GPU, weights stay packed in VRAM and dequantize on use. q4 (asymmetric int4 + q8 attention) shrinks the small-music DiT from 1.6 GB to about 0.3 GB, at roughly 9% velocity error.
+- **quantization** — `--precision auto|fp32|fp16|bf16|q8|q8a8|q4`. On the GPU, weights stay packed in VRAM and dequantize on use. q4 (asymmetric int4 + q8 attention) shrinks the small-music DiT from 1.6 GB to about 0.3 GB, at roughly 9% velocity error.
 - **steering** — because the runtime owns every intermediate tensor, training-free activation steering is a single tensor add at a known boundary (the diffusion latent, a DiT residual, the conditioning vectors, or the pre-decode latent). See [Steering](#steering).
 - **medium model** — differential DiT attention plus a sliding-window decoder, both device-resident on CUDA.
 
-Every stage is parity-checked against the `stable-audio-tools` PyTorch reference; correctness is measured, not assumed. On an RTX 3070, a 10 s / 8-step small-music clip generates in about 0.29 s warm; the medium model runs fully on the GPU in about 2.2 s.
+Every stage is parity-checked against the `stable-audio-tools` PyTorch reference; correctness is measured, not assumed. On an RTX 3070 with the default settings, a 10 s small-music clip generates in about 0.06 s warm and a 60 s one in about 0.25 s; the medium model runs fully on the GPU in about 0.18 s (10 s) and 0.85 s (60 s).
 
 The CPU path (AVX2/FMA + OpenMP, zero-copy mmap weights) is the reference and must always build with `make`. CUDA is an optional accelerator.
 
@@ -78,10 +78,29 @@ python scripts/export_tokenizer.py models/small-music
 make quantize && ./aria-quantize models/small-music dit.q4.aria q4
 ./aria -m models/small-music --uncond -d 10 --load-quant dit.q4.aria -o out.wav
 
+# sampling schedule: ref = stable_audio_3 generate() (LogSNR, rate 0), len = aria's
+# length-dependent default, full = the training shift; --headroom 6 generates 6 s past
+# the duration and crops, like the reference
+./aria -m models/small-music -p "..." -d 30 --schedule ref -o out.wav
+
 # inspect / all flags
 ./aria -m models/small-music --info
 ./aria -h          # full flag list;  make help  for build targets
 ```
+
+Defaults are tuned for the machine at hand: one OpenMP thread per physical core
+(`OMP_NUM_THREADS` overrides), a decode window sized from physical RAM
+(`ARIA_DEC_WINDOW=<sec>` overrides), and GEMM blocking chosen per shape. None of these
+change the output.
+
+Two defaults do change the output, and are on because they are faster and passed an A/B
+quality check against the exact path (see [BENCHMARKS.md](BENCHMARKS.md)):
+
+| default | where | exact alternative |
+|---|---|---|
+| 6 denoising steps | everywhere | `-s 8` |
+| q8 DiT with int8 activations (`q8a8`) | GPUs with int8 tensor cores (sm_75+) | `--precision fp32` (fp16 storage on the GPU) |
+| fp32 DiT | CPU (the int8 paths are slower on x86) | — |
 
 `-m <dir>` is any directory with `model_config.json` and `model.safetensors` (what `download_model.sh` produces, or a raw Hugging Face snapshot). Text prompts need the T5Gemma weights plus the exported tokenizer; `--uncond` and `--prompt-embed` work without them.
 

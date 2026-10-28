@@ -38,6 +38,25 @@ void aria_logsnr_schedule(float *out, int steps, float sigma_max,
                           float anchor_logsnr, float anchor_length, float rate,
                           float logsnr_end, float seq_len);
 
+/* Timestep shifts of stable-audio-3 inference/distribution_shift.py, as named by a
+ * model config's {sampling_,}distribution_shift_options "type". */
+typedef enum { ARIA_SHIFT_NONE = 0, ARIA_SHIFT_LOGSNR, ARIA_SHIFT_FULL, ARIA_SHIFT_FLUX } aria_shift_type;
+typedef struct {
+    int   type;                                           /* aria_shift_type */
+    float anchor_length, anchor_logsnr, rate, logsnr_end; /* LOGSNR: LogSNRShift */
+    float base_shift, max_shift; int use_sine;            /* FULL:   DistributionShift */
+    float alpha_min, alpha_max;                           /* FLUX:   FluxDistributionShift */
+    float min_length, max_length;                         /* FULL + FLUX */
+} aria_dist_shift;
+
+/* The reference class defaults for `type` (note LogSNRShift's own rate default is 1). */
+void aria_dist_shift_defaults(aria_dist_shift *s, int type);
+
+/* build_schedule: linspace(sigma_max, 0, steps+1) warped by the shift at seq_len
+ * (clamped >= 1), first value pinned to sigma_max. LOGSNR == aria_logsnr_schedule. */
+void aria_build_schedule(float *out, int steps, float sigma_max,
+                         const aria_dist_shift *s, int seq_len);
+
 /* Denoiser callback: write velocity v_out[n] for input x[n] at timestep t. */
 typedef void (*aria_denoiser_fn)(void *ctx, const float *x, float t, float *v_out, int n);
 

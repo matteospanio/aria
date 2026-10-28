@@ -27,15 +27,21 @@ typedef struct aria_ctx aria_ctx;
 
 typedef enum { ARIA_DEVICE_CPU = 0, ARIA_DEVICE_CUDA = 1, ARIA_DEVICE_AUTO = 2 } aria_device;
 
+/* Sampling schedule: the model's reference shift (what stable_audio_3 generate() uses),
+ * aria's legacy length-dependent LogSNR (rate=1), or the training DistributionShift (what
+ * the stable-audio-3 TensorRT runtime samples with). DEFAULT = the runtime's choice. */
+typedef enum { ARIA_SCHED_DEFAULT = 0, ARIA_SCHED_REF, ARIA_SCHED_LEN, ARIA_SCHED_FULL } aria_schedule;
+
 typedef struct {
     const char *prompt;             /* text prompt (Phase 1) */
     const char *prompt_embed_path;  /* optional precomputed cross-attn embedding, f32 [256,768] */
     float seconds_total;            /* requested duration in seconds */
-    int   steps;                    /* denoising steps (default 8) */
+    int   steps;                    /* denoising steps (0 = the model's default, 6 for SA3) */
     float cfg_scale;                /* CFG scale (default 1.0 = off) */
     int64_t seed;                   /* RNG seed (-1 = random) */
     aria_device device;             /* DiT backend: auto (default) / cpu / cuda (E8.5) */
-    aria_dtype precision;           /* DiT weight precision: fp32 (default) / q8 / q4 (E9, CPU) */
+    aria_dtype precision;           /* DiT precision: ARIA_DTYPE_AUTO (default: the device's best) /
+                                     * fp32 / fp16 / bf16 / q8 / q8a8 / q4 */
     const char *load_quant;         /* optional pre-quantized DiT (.aria) from aria-quantize (E9.2) */
     /* continue / inpaint (E7): regenerate part of an existing clip, keep the rest.
      * Set init_audio to a WAV path. inpaint_from_s..inpaint_to_s marks the region
@@ -64,9 +70,13 @@ typedef struct {
      * to decode ~2 s per chunk instead of the whole ~12.5 s window. 0/0 = full decode.
      * CPU decoders only; the device decoder ignores it (already fast, monolithic). */
     float decode_from_s, decode_to_s;
+    aria_schedule schedule;         /* sampling schedule (default: ARIA_SCHED_DEFAULT) */
+    float headroom_s;               /* stable_audio_3 duration_padding_sec: generate this many
+                                     * extra seconds of latent, cropped after decode (text->audio
+                                     * only; 0 = off; the reference uses 6) */
 } aria_gen_params;
 
-#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 8, 1.0f, 0, ARIA_DEVICE_AUTO, ARIA_F32, NULL, NULL, 0.0f, 0.0f, 0, NULL, NULL, 0, NULL, NULL, NULL, 0.0f, 0.0f }
+#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 0, 1.0f, 0, ARIA_DEVICE_AUTO, ARIA_DTYPE_AUTO, NULL, NULL, 0.0f, 0.0f, 0, NULL, NULL, 0, NULL, NULL, NULL, 0.0f, 0.0f, ARIA_SCHED_DEFAULT, 0.0f }
 
 /* Load a model from a directory containing model_config.json + model.safetensors.
  * Returns NULL on error (see aria_last_error()). */

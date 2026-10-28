@@ -162,6 +162,13 @@ void aria_cuda_dit_set_request(aria_cuda_dit *h, const aria_sa3_dit_req_view *rv
 void aria_cuda_dit_set_step(aria_cuda_dit *h, int step);
 /* v_CT = velocity(x_CT, gcond); x_CT/v_CT are [io_channels, T], gcond is [6*ed]. */
 void aria_cuda_dit_step(aria_cuda_dit *h, float *v_CT, const float *x_CT, const float *gcond);
+/* E17.2: the whole pingpong loop on the device, bit-identical to aria_cuda_dit_step + the
+ * host pingpong. gcond_all = [steps][6*ed] (per-step aria_sa3_dit_global_cond); noise(buf,
+ * n, user) fills each step's N(0,1) draw in order. x_CT: in = initial noise, out = final
+ * latent. Returns -1 (nothing run; use the host loop) if its staging can't be allocated. */
+int aria_cuda_dit_sample(aria_cuda_dit *h, float *x_CT, const float *sched, int steps,
+                         const float *gcond_all, void (*noise)(float *, int, void *), void *noise_user,
+                         void (*progress)(int, int, void *), void *progress_user);
 
 #ifdef __cplusplus
 }

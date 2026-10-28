@@ -24,6 +24,7 @@
 #include <math.h>
 #include <time.h>
 #include <sys/resource.h>
+#include <unistd.h>
 
 /* optional per-stage timing + memory (set ARIA_PROFILE=1) */
 static double sa3_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
@@ -197,7 +198,11 @@ static float *sa3_build_inpaint_local(aria_ctx *ctx, sa3_state *st,
     if (owns_a) aria_audio_free(a);
 
     if (!st->enc_taae) st->enc_taae = aria_sa3_enc_load(ctx->sf);
-    if (!st->enc_taae) { aria_set_error("inpaint: taae encoder load failed"); free(audio); return NULL; }
+    if (!st->enc_taae) {
+        aria_set_error("inpaint: taae encoder load failed (continue/inpaint/stream support the "
+                       "small models' SAME-S encoder only)");
+        free(audio); return NULL;
+    }
     /* the SAME encoder rounds T_patch up to a multiple of 32 -> its latent length is
      * ceil(T/2)*2 (= T for even T, T+1 for odd T), which can exceed the DiT's T; size the
      * buffer to the encoder's actual output so the write fits, then use the first T. */
@@ -242,6 +247,14 @@ static float *sa3_build_inpaint_local(aria_ctx *ctx, sa3_state *st,
  * frame (the column across channels). The step index is the pingpong update it follows,
  * so a latent steer at step i first perturbs the DiT input at step i+1. */
 typedef struct { const aria_steer_set *steer; int C, T; } sa3_latent_ctx;
+#ifdef ARIA_CUDA
+static int sa3_has_latent_steer(const aria_steer_set *steer) {
+    for (int s = 0; steer && s < steer->n; s++)
+        if (steer->items[s].site == ARIA_STEER_LATENT && steer->items[s].scale != 0.0f) return 1;
+    return 0;
+}
+static void sa3_noise(float *out, int n, void *rng) { aria_rng_randn((aria_rng *)rng, out, n); }
+#endif
 static void sa3_steer_latent(int step, float *x_CT, int n, void *user) {
     (void)n;   /* == C*T */
     const sa3_latent_ctx *lc = user;
@@ -305,8 +318,13 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     sa3_state *st = state;
     const int ED = 768;       /* cond_token_dim */
     const int N_PROMPT = 256; /* T5Gemma tokens */
+    if (p->headroom_s > 0 && (p->init_audio || p->init_audio_mem)) {
+        aria_set_error("generate: headroom is text->audio only (not continue/inpaint/stream)");
+        return -1;
+    }
 
     /* prompt embedding [256,768]: text -> tokenize+encode, or precomputed file, or zeros */
+    double tp0 = sa3_now();   /* profile: prompt (tokenize + T5, lazily loaded) */
     float *prompt = calloc((size_t)N_PROMPT * ED, sizeof(float));
     aria_parity_tensor pe; int have_pe = 0;
     if (p->prompt && p->prompt[0]) {
@@ -341,6 +359,7 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     }
     /* else: unconditional (zeros) */
 
+    double t_prompt = sa3_now() - tp0;
     /* E12.4: cond/text steer on this private prompt copy (never the cache), before
      * to_cond_embed. No step window / layer for this site. */
     sa3_steer_cond(p->steer, prompt, N_PROMPT, ED);
@@ -356,9 +375,17 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     free(prompt);
     if (have_pe) aria_parity_free(&pe);
 
-    /* latent length from requested duration */
-    int T = (int)lround((double)p->seconds_total * st->sample_rate / st->cfg.downsampling_ratio);
-    if (T < 1) T = 1;
+    /* latent length from requested duration; headroom (stable_audio_3 duration_padding_sec)
+     * generates past seconds_total and the output is cropped back to T_out frames */
+    int T_out = (int)lround((double)p->seconds_total * st->sample_rate / st->cfg.downsampling_ratio);
+    if (T_out < 1) T_out = 1;
+    /* the reference's effective length: ceil(int(seconds * sr) / ds) */
+    int eff = (int)ceil((double)(long long)((double)p->seconds_total * st->sample_rate) / st->cfg.downsampling_ratio);
+    int T = T_out;
+    if (p->headroom_s > 0) {
+        T = eff + (int)(p->headroom_s * st->sample_rate / st->cfg.downsampling_ratio);
+        if (T < T_out) T = T_out;
+    }
     int n = st->cfg.io_channels * T;  /* 256 * T */
 
     /* init noise */
@@ -369,9 +396,21 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     aria_rng_randn(&rng, x, n);
 
     /* schedule + pingpong */
-    int steps = p->steps > 0 ? p->steps : 8;
+    /* default 6 steps: A/B vs 8 (12 prompts x 4 seeds, both models, 10 + 60 s) -- CLAP
+     * prompt similarity non-inferior everywhere (better at small 10 s), wav2taste drift
+     * below the seed-noise floor; 25 % fewer DiT forwards */
+    int steps = p->steps > 0 ? p->steps : 6;
     float *sched = malloc((size_t)(steps + 1) * sizeof(float));
-    aria_logsnr_schedule(sched, steps, 1.0f, -6.2f, 2000.0f, 1.0f, 2.0f, (float)T);
+    /* LEN (legacy, seq_len = T) stays the default until the reference schedule passes
+     * the A/B; REF/FULL follow the reference at its effective length. */
+    aria_schedule sk = p->schedule ? p->schedule : ARIA_SCHED_LEN;
+    if (sk == ARIA_SCHED_LEN) {
+        aria_dist_shift len; aria_dist_shift_defaults(&len, ARIA_SHIFT_LOGSNR);  /* rate 1, anchor 2000 */
+        aria_build_schedule(sched, steps, 1.0f, &len, T);
+    } else {
+        aria_build_schedule(sched, steps, 1.0f,
+                            sk == ARIA_SCHED_FULL ? &st->cfg.train_shift : &st->cfg.sample_shift, eff);
+    }
 
     int profile = getenv("ARIA_PROFILE") != NULL;
 
@@ -383,9 +422,9 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     /* B2: fp16/bf16 are now real CPU storage formats (half the DiT weight stream +
      * resident RAM; fp32 compute via pack-time widening). On the GPU they map to the
      * existing fp16 device storage as before. */
-    aria_dtype prec = (p->precision == ARIA_Q8 || p->precision == ARIA_Q4 ||
+    aria_dtype prec = (p->precision == ARIA_Q8 || p->precision == ARIA_Q4 || p->precision == ARIA_Q8A8 ||
                        p->precision == ARIA_F16 || p->precision == ARIA_BF16)
-                      ? p->precision : ARIA_F32;
+                      ? p->precision : ARIA_F32;   /* AUTO on the CPU: fp32 (the fastest x86 mode) */
     int quant = (prec != ARIA_F32);
 
     /* E9.2: a pre-quantized DiT overlay (.aria from aria-quantize) -> CPU path,
@@ -403,6 +442,7 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     if (loaded_quant) quant = 1;
 
     int on_gpu = 0;
+    double tg0 = sa3_now();   /* profile: one-time DiT weight upload / overlay build */
 #ifdef ARIA_CUDA
     /* auto: GPU when it's worth it (sm_70+) and fits; cuda: force any device
      * (CPU-fallback on OOM); cpu: never. Packed-quant stays on the CPU DiT. */
@@ -415,9 +455,12 @@ static int sa3_generate(aria_ctx *ctx, void *state,
                     (p->device == ARIA_DEVICE_AUTO && aria_cuda_recommended()));
     if (want_gpu && !st->cdit) {   /* upload + quantize weights once; reused across gens */
         aria_sa3_dit_view view; aria_sa3_dit_get_view(st->dit, &view);  /* f32 view (overlay-independent) */
-        st->cdit = aria_cuda_dit_create(&view, prec);
+        /* AUTO on int8-tensor-core GPUs: q8 weights + W8A8 GEMMs -- A/B vs fp16: CLAP
+         * non-inferior, wav2taste drift below seed noise; faster and ~1/4 less VRAM */
+        aria_dtype gprec = (p->precision == ARIA_DTYPE_AUTO && aria_cuda_int8_tc()) ? ARIA_Q8A8 : prec;
+        st->cdit = aria_cuda_dit_create(&view, gprec);
         const char *how = p->device == ARIA_DEVICE_AUTO ? "auto" : "forced";
-        const char *pn = quant ? aria_dtype_name(prec) : "fp16";
+        const char *pn = gprec != ARIA_F32 ? aria_dtype_name(gprec) : "fp16";
         if (st->cdit) fprintf(stderr, "[aria] DiT: GPU device-resident, %s (%s)\n", pn, how);
         else fprintf(stderr, "[aria] DiT: GPU insufficient VRAM, using CPU (%s)\n", how);
     }
@@ -471,10 +514,29 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     }
 #endif
     double t1 = sa3_now();
+    double t_gpu_init = t0 - tg0;   /* the first request's decoder upload lands in setup */
     /* E12.2: latent steer hooks the sampler between steps (host x[256,T], CPU+GPU). */
     sa3_latent_ctx lc = { p->steer, st->cfg.io_channels, T };
-    aria_pingpong_cb(x, n, sched, steps, sa3_denoise, &dc, &rng, NULL,
-                     p->progress, p->progress_user, sa3_steer_latent, &lc);
+    int piped = 0;
+#ifdef ARIA_CUDA
+    /* E17.2: on the GPU the whole loop runs device-side (the host only enqueues), unless a
+     * latent steer needs host x between steps. Bit-identical; ARIA_NO_PIPE=1 forces the
+     * host loop. gcond depends only on (seconds, t), so every step's is computed up front. */
+    if (on_gpu && !sa3_has_latent_steer(p->steer) && !getenv("ARIA_NO_PIPE")) {
+        size_t ng = (size_t)6 * st->cfg.embed_dim;
+        float *gc_all = malloc((size_t)steps * ng * sizeof(float));
+        if (gc_all) {
+            for (int i = 0; i < steps; i++)
+                aria_sa3_dit_global_cond(st->dit, dc.global_seconds, sched[i], gc_all + (size_t)i * ng);
+            piped = aria_cuda_dit_sample(st->cdit, x, sched, steps, gc_all, sa3_noise, &rng,
+                                         p->progress, p->progress_user) == 0;
+            free(gc_all);
+        }
+    }
+#endif
+    if (!piped)
+        aria_pingpong_cb(x, n, sched, steps, sa3_denoise, &dc, &rng, NULL,
+                         p->progress, p->progress_user, sa3_steer_latent, &lc);
     double t2 = sa3_now();
 #ifdef ARIA_CUDA
     free(dc.gcond);   /* the device handle persists on st; only gcond is per-call */
@@ -482,14 +544,21 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     aria_sa3_dit_req_end(req);
 
     /* decode -> interleaved stereo (GPU if the DiT ran there, else CPU).
-     * E16.1: on the CPU, decode long latents in ~8 s windows (halo-recompute) so
-     * peak decode arena is O(window) not O(T) -- byte-identical to monolithic.
-     * ARIA_DEC_WINDOW=<seconds> overrides the window (0 disables). GPU windowed
-     * decode is future work (E16.1b): the device decoders stay monolithic. */
-    double win_s = 8.0;
+     * E16.1: on the CPU, decode long latents in windows (halo-recompute) so peak decode
+     * memory is O(window) not O(T) -- byte-identical to monolithic, so the window only
+     * trades peak memory for halo recompute. Default: the largest window whose slice fits
+     * 1/32 of physical RAM (>= 8 s); ARIA_DEC_WINDOW=<seconds> overrides (0 disables).
+     * GPU windowed decode is future work (E16.1b): the device decoders stay monolithic. */
+    int win_frames;
     const char *we = getenv("ARIA_DEC_WINDOW");
-    if (we && we[0]) win_s = atof(we);
-    int win_frames = win_s > 0 ? (int)lround(win_s * st->sample_rate / st->cfg.downsampling_ratio) : 0;
+    if (we && we[0]) {
+        double win_s = atof(we);
+        win_frames = win_s > 0 ? (int)lround(win_s * st->sample_rate / st->cfg.downsampling_ratio) : 0;
+    } else {
+        size_t budget = (size_t)sysconf(_SC_PHYS_PAGES) * (size_t)sysconf(_SC_PAGESIZE) / 32;
+        win_frames = st->is_medium ? aria_sa3_dec_medium_window_for_budget(budget)
+                                   : aria_sa3_dec_window_for_budget(budget);
+    }
     int windowed = win_frames > 0 && T > win_frames;   /* only when there's >1 window */
     /* B5 (E14.1): partial-emit range decode -- decode only [decode_from_s, decode_to_s)
      * of the audio (the CPU decoders; the GPU path stays monolithic). The buffer is
@@ -533,8 +602,9 @@ static int sa3_generate(aria_ctx *ctx, void *state,
         double cur_rss = 0;   /* current resident set (post host-weight drop on GPU) */
         FILE *sf = fopen("/proc/self/statm", "r");
         if (sf) { long sz = 0, res = 0; if (fscanf(sf, "%ld %ld", &sz, &res) == 2) cur_rss = res * 4096.0 / 1048576.0; fclose(sf); }
-        fprintf(stderr, "[aria] profile: setup=%.2fs dit=%.2fs decode=%.2fs (T=%d steps=%d) | RSS cur %.0f / peak %.0f MB",
-                t1 - t0, t2 - t1, t3 - t2, T, steps, cur_rss, ru.ru_maxrss / 1024.0);
+        static const char *sched_names[] = {"default", "ref", "len", "full"};
+        fprintf(stderr, "[aria] profile: prompt=%.2fs weights=%.2fs setup=%.2fs dit=%.2fs decode=%.2fs (T=%d steps=%d sched=%s) | RSS cur %.0f / peak %.0f MB",
+                t_prompt, t_gpu_init, t1 - t0, t2 - t1, t3 - t2, T, steps, sched_names[sk], cur_rss, ru.ru_maxrss / 1024.0);
 #ifdef ARIA_CUDA
         if (st->cdit || st->cdec || st->cdec_med) {
             size_t used = 0, total = 0; aria_cuda_meminfo(&used, &total);
@@ -543,8 +613,8 @@ static int sa3_generate(aria_ctx *ctx, void *state,
 #endif
         fprintf(stderr, "\n");
     }
-    aria_audio *a = aria_audio_alloc(st->sample_rate, 2, (int64_t)T * 4096);
-    for (int64_t i = 0; i < (int64_t)T * 4096; i++) {
+    aria_audio *a = aria_audio_alloc(st->sample_rate, 2, (int64_t)T_out * 4096);
+    for (int64_t i = 0; i < (int64_t)T_out * 4096; i++) {
         a->data[i * 2 + 0] = audio[i];
         a->data[i * 2 + 1] = audio[(int64_t)T * 4096 + i];
     }

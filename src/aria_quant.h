@@ -30,6 +30,8 @@ typedef enum {
     ARIA_BF16 = 2,   /* bfloat16 storage, fp32 compute (E9.0 wiring) */
     ARIA_Q8   = 3,   /* int8, per-row symmetric */
     ARIA_Q4   = 4,   /* int4, per-block asymmetric (zero-point) */
+    ARIA_Q8A8 = 5,   /* int8 weights + per-token int8 activations (W8A8 int8 GEMMs) */
+    ARIA_DTYPE_AUTO = 6,   /* the runtime's best for the device (the default) */
 } aria_dtype;
 
 const char *aria_dtype_name(aria_dtype dt);
@@ -74,6 +76,7 @@ typedef struct {
     const float *f32;    /* dt==F32: borrowed */
     void *q;             /* dt==Q8: int8_t* ; dt==Q4: uint8_t* (owned) */
     float *scale;        /* dt==Q8/Q4: scales (owned) */
+    int a8;              /* dt==Q8: also quantize activations (W8A8; set via ARIA_Q8A8) */
 } aria_qweight;
 
 /* pack W[N,K] into `w` per dt (F32 borrows W; Q8/Q4 allocate + quantize). */

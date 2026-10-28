@@ -22,6 +22,7 @@ int aria_cuda_available(void);
  * Weaker cards (e.g. GT 1030, sm_61) are slower than the AVX2 CPU, so `--device
  * auto` skips them; `--device cuda` still forces any available device. */
 int aria_cuda_recommended(void);
+int aria_cuda_int8_tc(void);   /* sm_75+: int8 tensor cores for W8A8 */
 /* short device description into buf (name, compute capability, VRAM). */
 void aria_cuda_device_info(char *buf, size_t buflen);
 /* current device memory: *used and *total in bytes (used = total - free). */

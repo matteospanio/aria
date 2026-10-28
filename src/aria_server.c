@@ -319,13 +319,13 @@ static void usage(const char *prog) {
     fprintf(stderr,
             "aria-server - resident HTTP server for the aria runtime\n\n"
             "Usage: %s -m <model_dir> [--port 8321] [--device cpu|cuda|auto]\n"
-            "          [-s <steps=8>] [-d <default_seconds=10>]\n", prog);
+            "          [-s <steps (default: the model's, 6)>] [-d <default_seconds=10>]\n", prog);
 }
 
 int main(int argc, char **argv) {
     const char *model_dir = NULL;
     int port = 8321;
-    worker_cfg w = { NULL, ARIA_DEVICE_AUTO, 8, 10.0f };
+    worker_cfg w = { NULL, ARIA_DEVICE_AUTO, 0, 10.0f };   /* steps 0 = the model's default */
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model_dir = argv[++i];
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);

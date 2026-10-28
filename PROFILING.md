@@ -8,12 +8,14 @@ Set `ARIA_PROFILE=1` on any run; aria prints, to stderr, the per-stage wall time
 plus peak host RSS and (CUDA build) resident GPU VRAM:
 
 ```
-$ ARIA_PROFILE=1 ./aria -m "$MODEL" --uncond -d 10 -s 8 --device cuda -o out.wav
-[aria] profile: setup=0.10s dit=0.16s decode=0.03s (T=108 steps=8) | peak RSS 2303 MB | GPU 1464/7832 MB
+$ ARIA_PROFILE=1 ./aria -m "$MODEL" -p "warm piano" -d 10 -s 8 --device cuda -o out.wav
+[aria] profile: prompt=0.05s weights=0.30s setup=0.08s dit=0.09s decode=0.07s (T=108 steps=8 sched=len) | RSS cur 417 / peak 2275 MB | GPU 1514/7832 MB
 ```
 
-- **setup** = per-request conditioning + (GPU) weight upload · **dit** = the
-  denoise loop · **decode** = taae decoder.
+- **prompt** = tokenize + T5Gemma (first prompt also loads it; repeats hit an LRU) ·
+  **weights** = the one-time DiT upload (GPU) or overlay build (CPU) · **setup** =
+  per-request conditioning (+ the first request's decoder upload) · **dit** = the
+  denoise loop · **decode** = taae decoder · **sched** = the sampling schedule.
 - **peak RSS** = `getrusage` high-water mark (the mmap'd weights fault in here).
 - **GPU x/y MB** = `cudaMemGetInfo` used/total at the end of the run.
 

@@ -195,20 +195,20 @@ static void med_decode_slice(const aria_sa3_dec_medium *m, float *audio,
     aria_arena_free(&ar);
     free(rc); free(rs);
 
-    /* 5. last 16 of each 17-group -> feat[1536, T*16] (channel-major) */
+    /* 5-6. the k1 WNConv1d mapping 1536->512 over the last 16 of each 17-group is a GEMM
+     * on those token rows (copied contiguously), then unpatch the [Lt,512] rows -> stereo */
     int Lt = T * 16;
-    float *feat = malloc((size_t)D * Lt * sizeof(float));
+    float *feat = malloc((size_t)Lt * D * sizeof(float));   /* [Lt, 1536] token-major */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (int t = 0; t < T; t++)
-        for (int j = 0; j < 16; j++)
-            for (int d = 0; d < D; d++)
-                feat[(size_t)d * Lt + (size_t)t * 16 + j] = seq[(size_t)(t * MED_SEG + 1 + j) * D + d];
+        memcpy(feat + (size_t)t * 16 * D, seq + (size_t)(t * MED_SEG + 1) * D, (size_t)16 * D * sizeof(float));
     free(seq);
-
-    /* 6. WNConv1d mapping 1536->512 (k1 p0), then unpatch -> stereo */
-    float *mapped = malloc((size_t)MED_OUT * Lt * sizeof(float));
-    aria_conv1d(mapped, feat, m->mapping_w, m->mapping_b, D, MED_OUT, 1, 0, Lt);
+    float *mapped = malloc((size_t)Lt * MED_OUT * sizeof(float));
+    aria_linear(mapped, feat, m->mapping_w, m->mapping_b, Lt, D, MED_OUT);
     free(feat);
-    aria_unpatch_stereo(audio, mapped, Lt);   /* [2, Lt*256] = [2, T*4096] */
+    aria_unpatch_stereo_tm(audio, mapped, Lt);   /* [2, Lt*256] = [2, T*4096] */
     free(mapped);
 }
 
@@ -234,11 +234,20 @@ void aria_sa3_dec_medium_forward(const aria_sa3_dec_medium *m, float *audio, con
  *      Byte-identical output; peak arena O(window) (taae_med_block_floats(N=wf*17)). */
 #define MED_WIN_HALO 12   /* latent frames = 12 blocks * 17-token band / 17 tokens/frame */
 
+int aria_sa3_dec_medium_window_for_budget(size_t budget_bytes) {
+    /* per decoded frame: the block arena (taae_med_block_floats = 16*N*dim) + seq */
+    size_t per_frame = (size_t)18 * MED_SEG * MED_D * sizeof(float);
+    long w = (long)(budget_bytes / per_frame) - 2 * MED_WIN_HALO;
+    return w > 86 ? (int)(w > 1 << 20 ? 1 << 20 : w) : 86;   /* never under ~8 s */
+}
+
 void aria_sa3_dec_medium_forward_windowed(const aria_sa3_dec_medium *m, float *audio,
                                           const float *latent, int T, int window_frames) {
     int W = window_frames > 0 ? window_frames : 86;   /* ~8 s at 44.1 kHz / 4096 */
     const int H = MED_WIN_HALO;
     int maxwf = W + 2 * H;
+    /* one slice would cover the clip: decode it whole -- same bytes, same peak */
+    if (T <= maxwf) { med_decode_slice(m, audio, latent, T, 0); return; }
     float *lat_slice = malloc((size_t)256 * maxwf * sizeof(float));
     float *aud_slice = malloc((size_t)2 * maxwf * 4096 * sizeof(float));
     for (int start = 0; start < T; start += W) {

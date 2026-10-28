@@ -13,6 +13,7 @@
 #ifndef ARIA_OPS_H
 #define ARIA_OPS_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* ---- half-precision storage helpers (B2) ---- */
@@ -53,6 +54,9 @@ static inline uint16_t aria_float_to_half(float x) {
     if (rem > 0x1000u || (rem == 0x1000u && (out & 1))) out++;   /* RTNE (may carry into exp) */
     return out;
 }
+/* bulk fp32 -> fp16 (RTNE; F16C where built, else aria_float_to_half -- same bits for every
+ * finite value, and the same as CUDA's __float2half), parallel. For device weight upload. */
+void aria_f32_to_f16_n(uint16_t *dst, const float *src, size_t n);
 static inline float aria_bf16_to_float(uint16_t h) {
     union { uint32_t u; float fl; } v; v.u = (uint32_t)h << 16; return v.fl;
 }
@@ -67,6 +71,11 @@ static inline uint16_t aria_float_to_bf16(float x) {   /* RTNE on bit 16 */
 /* y[M,N] = x[M,K] @ W^T + b ; W is [N,K] (PyTorch Linear weight), b is [N] or NULL. */
 void aria_linear(float *y, const float *x, const float *W, const float *b,
                  int M, int K, int N);
+/* aria_linear without the small-GEMM shortcut (always the packed kernel where built),
+ * so each output's math does not depend on M/N -- for callers whose sizes vary per
+ * request but must stay byte-identical to a larger run (T5 real-token attention). */
+void aria_linear_packed_only(float *y, const float *x, const float *W, const float *b,
+                             int M, int K, int N);
 
 /* B2: as aria_linear but W stored as fp16 (bf16=0) or bf16 (bf16=1) uint16; widened
  * to f32 while packing weight panels -- the compute path is the same packed kernel,

@@ -80,13 +80,16 @@ static void adaln_modulate(float *y, const float *scale, const float *shift, int
 
 /* y *= sigmoid(1 - gate), gate [dim] broadcast over S rows. */
 static void gate_sigmoid(float *y, const float *gate, int S, int dim) {
+    float *sg = malloc((size_t)dim * sizeof(float));   /* per column, not per row */
+    for (int i = 0; i < dim; i++) sg[i] = sigmoidf(1.0f - gate[i]);
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
     #endif
     for (int s = 0; s < S; s++) {
         float *yr = y + (size_t)s * dim;
-        for (int i = 0; i < dim; i++) yr[i] *= sigmoidf(1.0f - gate[i]);
+        for (int i = 0; i < dim; i++) yr[i] *= sg[i];
     }
+    free(sg);
 }
 
 /* Quantized mirror of a block's per-step GEMMs, built on load when precision != f32

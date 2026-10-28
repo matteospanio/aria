@@ -232,18 +232,42 @@ def dump_inpaint(model_dir, out_dir):
     print(f"dumped inpaint cond + DiT velocity to {d} (T={T}, mask {start_s}-{end_s}s)")
 
 
-def dump_schedule(out_dir):
-    """LogSNR schedule reference (build_schedule + LogSNRShift) for fixed params."""
-    from stable_audio_tools.inference.sampling import build_schedule, LogSNRShift
+def _ref_shifts(model_dir):
+    """The schedule shifts as the reference builds them from model_config.json: the
+    wrapper's sampling shift (what generate() samples with -- aria `--schedule ref`) and
+    its training shift (`--schedule full`, the stable-audio-3 TensorRT runtime's), plus
+    aria's legacy LogSNRShift(rate=1) (`--schedule len`). Built by the real
+    ConditionedDiffusionModelWrapper so the default is never re-derived by hand."""
+    try:
+        from stable_audio_3.models.diffusion import ConditionedDiffusionModelWrapper as W
+        from stable_audio_3.inference.sampling import build_schedule
+        from stable_audio_3.inference.distribution_shift import LogSNRShift
+    except ImportError:
+        from stable_audio_tools.models.diffusion import ConditionedDiffusionModelWrapper as W
+        from stable_audio_tools.inference.sampling import build_schedule, LogSNRShift
+    dif = json.load(open(os.path.join(model_dir, "model_config.json")))["model"]["diffusion"]
+    w = W(torch.nn.Identity(), torch.nn.Identity(), io_channels=256, sample_rate=44100,
+          min_input_length=1, distribution_shift_options=dif.get("distribution_shift_options"),
+          sampling_distribution_shift_options=dif.get("sampling_distribution_shift_options"))
+    shifts = {"ref": w.sampling_dist_shift, "full": w.dist_shift,
+              "len": LogSNRShift(anchor_length=2000, anchor_logsnr=-6.2, rate=1.0, logsnr_end=2.0)}
+    return shifts, build_schedule
+
+
+def dump_schedule(model_dir, out_dir):
+    """Schedule references (build_schedule + each shift) at reference effective lengths."""
+    shifts, build_schedule = _ref_shifts(model_dir)
     d = os.path.join(out_dir, "sampler")
     os.makedirs(d, exist_ok=True)
-    shift = LogSNRShift(anchor_length=2000, anchor_logsnr=-6.2, rate=1.0, logsnr_end=2.0)
-    for steps, seq_len in [(8, 323), (8, 1293), (16, 512)]:
-        sched = build_schedule(steps=steps, sigma_max=1.0, dist_shift=shift,
-                               effective_seq_len=seq_len, include_endpoint=True)
-        save_atns(os.path.join(d, f"sched_s{steps}_L{seq_len}.atns"),
-                  sched.float().cpu().numpy())
-    print(f"dumped LogSNR schedules to {d}")
+    for name, shift in shifts.items():
+        if shift is None:
+            continue
+        for steps, seq_len in [(8, 108), (6, 108), (8, 323), (8, 1293), (16, 512)]:
+            sched = build_schedule(steps=steps, sigma_max=1.0, dist_shift=shift,
+                                   effective_seq_len=seq_len, include_endpoint=True)
+            save_atns(os.path.join(d, f"sched_{name}_s{steps}_L{seq_len}.atns"),
+                      sched.float().cpu().numpy())
+    print(f"dumped ref/full/len schedules to {d}")
 
 
 def dump_dit_block_diff(out_dir):
@@ -508,7 +532,6 @@ def dump_e2e(model_dir, out_dir):
     """End-to-end: init noise -> pingpong(DiT denoiser) -> latent -> decode -> audio,
     with explicit injected per-step noise (matches the C aria_pingpong path)."""
     from stable_audio_tools.models.dit import DiffusionTransformer
-    from stable_audio_tools.inference.sampling import build_schedule, LogSNRShift
     from safetensors.torch import load_file
 
     cfg = json.load(open(os.path.join(model_dir, "model_config.json")))
@@ -528,8 +551,8 @@ def dump_e2e(model_dir, out_dir):
     glob = torch.zeros(1, 768)
     init_noise = torch.randn(1, 256, T)
     step_noise = torch.randn(steps, 256, T)
-    shift = LogSNRShift(anchor_length=2000, anchor_logsnr=-6.2, rate=1.0, logsnr_end=2.0)
-    sched = build_schedule(steps=steps, sigma_max=1.0, dist_shift=shift, effective_seq_len=T)
+    shifts, build_schedule = _ref_shifts(model_dir)   # the shift generate() samples with
+    sched = build_schedule(steps=steps, sigma_max=1.0, dist_shift=shifts["ref"], effective_seq_len=T)
 
     orig = torch.randn_like
     torch.randn_like = lambda x, *a, **k: torch.zeros_like(x)
@@ -567,7 +590,6 @@ def dump_inpaint_e2e(model_dir, out_dir):
     per-step noise -> latent -> decode -> audio. Unconditional (zero cross/global)
     like dump_e2e. Validates the full E7.1-E7.4 inpaint chain in C."""
     from stable_audio_tools.models.dit import DiffusionTransformer
-    from stable_audio_tools.inference.sampling import build_schedule, LogSNRShift
     from safetensors.torch import load_file
     from torch.nn.functional import interpolate
 
@@ -588,8 +610,8 @@ def dump_inpaint_e2e(model_dir, out_dir):
     glob = torch.zeros(1, 768)
     init_noise = torch.randn(1, 256, T)
     step_noise = torch.randn(steps, 256, T)
-    shift = LogSNRShift(anchor_length=2000, anchor_logsnr=-6.2, rate=1.0, logsnr_end=2.0)
-    sched = build_schedule(steps=steps, sigma_max=1.0, dist_shift=shift, effective_seq_len=T)
+    shifts, build_schedule = _ref_shifts(model_dir)   # the shift generate() samples with
+    sched = build_schedule(steps=steps, sigma_max=1.0, dist_shift=shifts["ref"], effective_seq_len=T)
 
     # continue-style mask: keep [0, audio_len/2) (=1), regenerate the rest (=0)
     mask_audio = torch.ones(1, audio_len)
@@ -671,7 +693,7 @@ if __name__ == "__main__":
     dump_dit_block(model_dir, out_dir)
     dump_dit_block_diff(out_dir)
     dump_dit_full(model_dir, out_dir)
-    dump_schedule(out_dir)
+    dump_schedule(model_dir, out_dir)
     dump_taae_block(model_dir, out_dir)
     dump_taae_medium_block(out_dir)
     dump_decoder(model_dir, out_dir)

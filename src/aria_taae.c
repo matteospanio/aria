@@ -51,73 +51,98 @@ void taae_block_overlay_free(taae_block_w *w) {
     w->qon = 0;
 }
 
-/* ---- head transpose helpers (chunk-local) ---- */
-static void extract_heads(float *dst, const float *src, int N, int H, int hd, int stride, int off) {
-    for (int h = 0; h < H; h++)
-        for (int s = 0; s < N; s++)
-            memcpy(dst + ((size_t)h * N + s) * hd, src + (size_t)s * stride + off + (size_t)h * hd,
-                   (size_t)hd * sizeof(float));
+/* ---- head transpose helpers ----
+ * rows = nch chunks x S tokens <-> heads [nch*H][S][hd]: chunk-local attention is then
+ * plain attention over nch*H "heads" of S tokens (nch = 1: the whole sequence). */
+static void extract_heads(float *dst, const float *src, int nch, int S, int H, int hd, int stride, int off) {
+    #ifdef _OPENMP
+    #pragma omp parallel for collapse(3) schedule(static)
+    #endif
+    for (int c = 0; c < nch; c++)
+        for (int h = 0; h < H; h++)
+            for (int s = 0; s < S; s++)
+                memcpy(dst + (((size_t)c * H + h) * S + s) * hd,
+                       src + ((size_t)c * S + s) * stride + off + (size_t)h * hd, (size_t)hd * sizeof(float));
 }
-static void merge_heads(float *dst, const float *src, int N, int H, int hd) {
-    for (int h = 0; h < H; h++)
-        for (int s = 0; s < N; s++)
-            memcpy(dst + (size_t)s * (H * hd) + (size_t)h * hd, src + ((size_t)h * N + s) * hd,
-                   (size_t)hd * sizeof(float));
+static void merge_heads(float *dst, const float *src, int nch, int S, int H, int hd) {
+    #ifdef _OPENMP
+    #pragma omp parallel for collapse(3) schedule(static)
+    #endif
+    for (int c = 0; c < nch; c++)
+        for (int h = 0; h < H; h++)
+            for (int s = 0; s < S; s++)
+                memcpy(dst + ((size_t)c * S + s) * (H * hd) + (size_t)h * hd,
+                       src + (((size_t)c * H + h) * S + s) * hd, (size_t)hd * sizeof(float));
+}
+static void sub_inplace(float *x, const float *y, size_t n) {   /* x -= y */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (size_t i = 0; i < n; i++) x[i] -= y[i];
+}
+static void add_inplace(float *x, const float *y, size_t n) {   /* residual: x += y */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (size_t i = 0; i < n; i++) x[i] += y[i];
 }
 
-void taae_block_forward(float *xc, int N, const taae_block_w *w,
+void taae_block_forward(float *xc, int nch, int S, const taae_block_w *w,
                         const float *rcos, const float *rsin, aria_arena *ar) {
     const int D = TAAE_D, H = TAAE_H, hd = TAAE_HD;
+    const int N = nch * S, nh = nch * H;   /* rows; chunk-local attention heads */
     size_t mark = aria_arena_save(ar);
+    /* h/o persist; the attention scratch is freed before the FF (see arena bytes) */
     float *h = aria_arena_floats(ar, (size_t)N * D);
-    float *res = aria_arena_floats(ar, (size_t)N * D);
-    float *qkv = aria_arena_floats(ar, (size_t)N * TAAE_QKV);
-    float *q = aria_arena_floats(ar, (size_t)H * N * hd);
-    float *k = aria_arena_floats(ar, (size_t)H * N * hd);
-    float *v = aria_arena_floats(ar, (size_t)H * N * hd);
-    float *qd = aria_arena_floats(ar, (size_t)H * N * hd);
-    float *kd = aria_arena_floats(ar, (size_t)H * N * hd);
-    float *ob = aria_arena_floats(ar, (size_t)H * N * hd);
-    float *od = aria_arena_floats(ar, (size_t)H * N * hd);
-    float *merged = aria_arena_floats(ar, (size_t)N * D);
     float *o = aria_arena_floats(ar, (size_t)N * D);
-    float *scores = aria_arena_floats(ar, (size_t)N * N);
-    float *ffs = aria_arena_floats(ar, (size_t)N * 3 * TAAE_INNER);
+    size_t amark = aria_arena_save(ar);
+    float *qkv = aria_arena_floats(ar, (size_t)N * TAAE_QKV);
+    float *q = aria_arena_floats(ar, (size_t)N * D);
+    float *k = aria_arena_floats(ar, (size_t)N * D);
+    float *v = aria_arena_floats(ar, (size_t)N * D);
+    float *qd = aria_arena_floats(ar, (size_t)N * D);
+    float *kd = aria_arena_floats(ar, (size_t)N * D);
+    float *ob = aria_arena_floats(ar, (size_t)N * D);
+    float *od = aria_arena_floats(ar, (size_t)N * D);
+    float *merged = aria_arena_floats(ar, (size_t)N * D);
 
-    /* self-attention (differential) */
-    memcpy(res, xc, (size_t)N * D * sizeof(float));
+    /* self-attention (differential); the residual adds in place (same fl(xc + o)) */
     aria_dynamic_tanh(h, xc, w->pre_alpha, w->pre_gamma, w->pre_beta, N, D);
     taae_gemm(qkv, h, w->to_qkv, &w->q_to_qkv, w->qon, NULL, N, D, TAAE_QKV);
-    extract_heads(q,  qkv, N, H, hd, TAAE_QKV, 0);
-    extract_heads(k,  qkv, N, H, hd, TAAE_QKV, 768);
-    extract_heads(v,  qkv, N, H, hd, TAAE_QKV, 1536);
-    extract_heads(qd, qkv, N, H, hd, TAAE_QKV, 2304);
-    extract_heads(kd, qkv, N, H, hd, TAAE_QKV, 3072);
-    aria_dynamic_tanh(q,  q,  w->qn_alpha, w->qn_gamma, w->qn_beta, H * N, hd);
-    aria_dynamic_tanh(qd, qd, w->qn_alpha, w->qn_gamma, w->qn_beta, H * N, hd);
-    aria_dynamic_tanh(k,  k,  w->kn_alpha, w->kn_gamma, w->kn_beta, H * N, hd);
-    aria_dynamic_tanh(kd, kd, w->kn_alpha, w->kn_gamma, w->kn_beta, H * N, hd);
-    aria_rope_apply(q,  rcos, rsin, H, N, hd, TAAE_ROT);
-    aria_rope_apply(qd, rcos, rsin, H, N, hd, TAAE_ROT);
-    aria_rope_apply(k,  rcos, rsin, H, N, hd, TAAE_ROT);
-    aria_rope_apply(kd, rcos, rsin, H, N, hd, TAAE_ROT);
-    aria_attention(ob, q,  k,  v, H, N, N, hd, NULL, scores);
-    aria_attention(od, qd, kd, v, H, N, N, hd, NULL, scores);
-    for (size_t i = 0; i < (size_t)H * N * hd; i++) ob[i] -= od[i];
-    merge_heads(merged, ob, N, H, hd);
+    extract_heads(q,  qkv, nch, S, H, hd, TAAE_QKV, 0);
+    extract_heads(k,  qkv, nch, S, H, hd, TAAE_QKV, 768);
+    extract_heads(v,  qkv, nch, S, H, hd, TAAE_QKV, 1536);
+    extract_heads(qd, qkv, nch, S, H, hd, TAAE_QKV, 2304);
+    extract_heads(kd, qkv, nch, S, H, hd, TAAE_QKV, 3072);
+    aria_dynamic_tanh(q,  q,  w->qn_alpha, w->qn_gamma, w->qn_beta, nh * S, hd);
+    aria_dynamic_tanh(qd, qd, w->qn_alpha, w->qn_gamma, w->qn_beta, nh * S, hd);
+    aria_dynamic_tanh(k,  k,  w->kn_alpha, w->kn_gamma, w->kn_beta, nh * S, hd);
+    aria_dynamic_tanh(kd, kd, w->kn_alpha, w->kn_gamma, w->kn_beta, nh * S, hd);
+    aria_rope_apply(q,  rcos, rsin, nh, S, hd, TAAE_ROT);
+    aria_rope_apply(qd, rcos, rsin, nh, S, hd, TAAE_ROT);
+    aria_rope_apply(k,  rcos, rsin, nh, S, hd, TAAE_ROT);
+    aria_rope_apply(kd, rcos, rsin, nh, S, hd, TAAE_ROT);
+    aria_attention(ob, q,  k,  v, nh, S, S, hd, NULL, NULL);
+    aria_attention(od, qd, kd, v, nh, S, S, hd, NULL, NULL);
+    sub_inplace(ob, od, (size_t)N * D);
+    merge_heads(merged, ob, nch, S, H, hd);
     taae_gemm(o, merged, w->to_out, &w->q_to_out, w->qon, NULL, N, D, D);
-    for (size_t i = 0; i < (size_t)N * D; i++) xc[i] = res[i] + o[i];
+    add_inplace(xc, o, (size_t)N * D);
+    aria_arena_restore(ar, amark);
 
     /* feed-forward (SwiGLU). Fused aria_ff_glu on the fp32 path; when the block is
      * quantized we unfuse into two aria_linear_qw GEMMs + the SiLU gate (same math,
      * lets the q8/fp16 overlay drive both FF matrices). */
-    memcpy(res, xc, (size_t)N * D * sizeof(float));
+    float *ffs = aria_arena_floats(ar, (size_t)N * 3 * TAAE_INNER);
     aria_dynamic_tanh(h, xc, w->ff_alpha, w->ff_gamma, w->ff_beta, N, D);
     if (w->qon) {
         /* reuse ffs[N, 3*inner]: proj = ffs[N, 2*inner], gated = ffs + N*2*inner
          * (same layout as the medium path -- no extra arena alloc). */
         float *gated = ffs + (size_t)N * 2 * TAAE_INNER;
         aria_linear_qw(ffs, h, &w->q_ff_in_w, w->ff_in_b, N);            /* [N, 2*inner] */
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (int nn = 0; nn < N; nn++)
             aria_silu_gate(gated + (size_t)nn * TAAE_INNER,
                            ffs + (size_t)nn * 2 * TAAE_INNER + TAAE_INNER,
@@ -126,13 +151,15 @@ void taae_block_forward(float *xc, int N, const taae_block_w *w,
     } else {
         aria_ff_glu(o, h, N, D, TAAE_INNER, D, w->ff_in_w, w->ff_in_b, w->ff_out_w, w->ff_out_b, ffs);
     }
-    for (size_t i = 0; i < (size_t)N * D; i++) xc[i] = res[i] + o[i];
+    add_inplace(xc, o, (size_t)N * D);
 
     aria_arena_restore(ar, mark);
 }
 
+#define TAAE_GROUP 32   /* chunks per batched block call: GEMM M = 32*34 = 1088 rows */
+
 void taae_chunk_pass(float *x, int L, const taae_block_w *blocks,
-                     const float *rcos, const float *rsin, int shift, aria_arena *arenas) {
+                     const float *rcos, const float *rsin, int shift) {
     const int S = TAAE_S, half = S / 2;  /* 17 */
     float *base = x, *pad = NULL;
     int n;
@@ -147,27 +174,29 @@ void taae_chunk_pass(float *x, int L, const taae_block_w *blocks,
                (size_t)half * TAAE_D * sizeof(float));
         base = pad; n = Lp / S;
     }
-    #ifdef _OPENMP
-    #pragma omp parallel for schedule(dynamic)
-    #endif
-    for (int c = 0; c < n; c++) {
-        #ifdef _OPENMP
-        aria_arena *ar = &arenas[omp_get_thread_num()];
-        #else
-        aria_arena *ar = &arenas[0];
-        #endif
-        float *chunk = base + (size_t)c * S * TAAE_D;
-        for (int b = 0; b < 3; b++) taae_block_forward(chunk, S, &blocks[b], rcos, rsin, ar);
+    /* chunks never see each other (attention is chunk-local), so each block runs over a
+     * group of chunks at once: the per-token GEMMs get M = TAAE_GROUP*S rows and stream
+     * a block's weights once per group, not once per 34-token chunk. Byte-identical to
+     * the per-chunk loop: per-row GEMM math does not depend on M, and every (chunk,
+     * head) attention is the same S x S computation. */
+    aria_arena ar;
+    aria_arena_init(&ar, taae_block_arena_bytes(TAAE_GROUP * S));
+    for (int c0 = 0; c0 < n; c0 += TAAE_GROUP) {
+        int g = n - c0 < TAAE_GROUP ? n - c0 : TAAE_GROUP;
+        float *chunk = base + (size_t)c0 * S * TAAE_D;
+        for (int b = 0; b < 3; b++) taae_block_forward(chunk, g, S, &blocks[b], rcos, rsin, &ar);
     }
+    aria_arena_free(&ar);
     if (shift) {
         memcpy(x, pad + (size_t)half * TAAE_D, (size_t)L * TAAE_D * sizeof(float));
         free(pad);
     }
 }
 
-size_t taae_block_arena_bytes(void) {
-    size_t N = TAAE_S;
-    size_t fl = 12 * N * TAAE_D + N * TAAE_QKV + N * N + 3 * N * TAAE_INNER + 4096;
+size_t taae_block_arena_bytes(int rows) {
+    /* h, o persist + max(attention: qkv + 7 heads + merged, FF: ffs) */
+    size_t att = (size_t)TAAE_QKV + 8 * TAAE_D, ff = (size_t)3 * TAAE_INNER;
+    size_t fl = (size_t)rows * (2 * TAAE_D + (att > ff ? att : ff)) + 4096;
     return fl * sizeof(float);
 }
 
@@ -175,8 +204,8 @@ size_t taae_block_arena_bytes(void) {
 #include <math.h>
 
 size_t taae_med_block_floats(int N, int dim, int inner) {
-    /* peak = attention phase: h+res+o(3) + qkv(5) + q,k,v,qd,kd,ob,od(7) + merged(1)
-     * = 16*N*dim. Banded attention keeps its tiny score window thread-local, so no
+    /* peak = attention phase: h+o(2) + qkv(5) + q,k,v,qd,kd,ob,od(7) + merged(1)
+     * = 15*N*dim (16 kept: one spare slab). Banded attention keeps its tiny score window thread-local, so no
      * N*N scores buffer. The FF (3*N*dim + 3*N*inner) is freed-and-reused, and
      * 3*N*inner < 13*N*dim for the medium decoder, so this bound covers it. */
     (void)inner;
@@ -187,11 +216,11 @@ void taae_med_block_forward(float *xc, int N, int dim, int H, int hd, int inner,
                             const taae_block_w *w, const float *rcos, const float *rsin,
                             int win, int sinusoidal, aria_arena *ar) {
     size_t mark = aria_arena_save(ar);
-    /* h/res/o persist; the attention scratch is freed before the FF (never live
+    /* h/o persist; the attention scratch is freed before the FF (never live
      * together) so the arena peak is the attention phase, not the sum -- saves
-     * ~3*N*inner (~100 MB on a 10 s medium clip). */
+     * ~3*N*inner (~100 MB on a 10 s medium clip). The residual adds in place
+     * (xc += o is the same fl(xc + o) the old res copy produced). */
     float *h   = aria_arena_floats(ar, (size_t)N * dim);
-    float *res = aria_arena_floats(ar, (size_t)N * dim);
     float *o   = aria_arena_floats(ar, (size_t)N * dim);
     size_t amark = aria_arena_save(ar);
     float *qkv = aria_arena_floats(ar, (size_t)N * 5 * dim);
@@ -205,14 +234,13 @@ void taae_med_block_forward(float *xc, int N, int dim, int H, int hd, int inner,
     float *merged = aria_arena_floats(ar, (size_t)N * dim);
 
     /* self-attention (differential): out = attn(q,k,v) - attn(qd,kd,v), banded mask */
-    memcpy(res, xc, (size_t)N * dim * sizeof(float));
     aria_dynamic_tanh(h, xc, w->pre_alpha, w->pre_gamma, w->pre_beta, N, dim);
     taae_gemm(qkv, h, w->to_qkv, &w->q_to_qkv, w->qon, NULL, N, dim, 5 * dim);
-    extract_heads(q,  qkv, N, H, hd, 5 * dim, 0);
-    extract_heads(k,  qkv, N, H, hd, 5 * dim, dim);
-    extract_heads(v,  qkv, N, H, hd, 5 * dim, 2 * dim);
-    extract_heads(qd, qkv, N, H, hd, 5 * dim, 3 * dim);
-    extract_heads(kd, qkv, N, H, hd, 5 * dim, 4 * dim);
+    extract_heads(q,  qkv, 1, N, H, hd, 5 * dim, 0);
+    extract_heads(k,  qkv, 1, N, H, hd, 5 * dim, dim);
+    extract_heads(v,  qkv, 1, N, H, hd, 5 * dim, 2 * dim);
+    extract_heads(qd, qkv, 1, N, H, hd, 5 * dim, 3 * dim);
+    extract_heads(kd, qkv, 1, N, H, hd, 5 * dim, 4 * dim);
     aria_dynamic_tanh(q,  q,  w->qn_alpha, w->qn_gamma, w->qn_beta, H * N, hd);
     aria_dynamic_tanh(qd, qd, w->qn_alpha, w->qn_gamma, w->qn_beta, H * N, hd);
     aria_dynamic_tanh(k,  k,  w->kn_alpha, w->kn_gamma, w->kn_beta, H * N, hd);
@@ -223,18 +251,20 @@ void taae_med_block_forward(float *xc, int N, int dim, int H, int hd, int inner,
     aria_rope_apply(kd, rcos, rsin, H, N, hd, TAAE_ROT);
     aria_attention_band(ob, q,  k,  v, H, N, hd, win);
     aria_attention_band(od, qd, kd, v, H, N, hd, win);
-    for (size_t i = 0; i < (size_t)H * N * hd; i++) ob[i] -= od[i];
-    merge_heads(merged, ob, N, H, hd);
+    sub_inplace(ob, od, (size_t)H * N * hd);
+    merge_heads(merged, ob, 1, N, H, hd);
     taae_gemm(o, merged, w->to_out, &w->q_to_out, w->qon, NULL, N, dim, dim);
-    for (size_t i = 0; i < (size_t)N * dim; i++) xc[i] = res[i] + o[i];
+    add_inplace(xc, o, (size_t)N * dim);
     aria_arena_restore(ar, amark);   /* free qkv/q/k/v/qd/kd/ob/od/merged/scores before the FF */
 
     /* feed-forward (GLU): out = value * act(gate), act = SiLU or sin(pi*x) */
     float *ffs = aria_arena_floats(ar, (size_t)N * 3 * inner);
-    memcpy(res, xc, (size_t)N * dim * sizeof(float));
     aria_dynamic_tanh(h, xc, w->ff_alpha, w->ff_gamma, w->ff_beta, N, dim);
     taae_gemm(ffs, h, w->ff_in_w, &w->q_ff_in_w, w->qon, w->ff_in_b, N, dim, 2 * inner);  /* [N, 2*inner] */
     float *gated = ffs + (size_t)N * 2 * inner;
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (int n = 0; n < N; n++) {
         const float *pr = ffs + (size_t)n * 2 * inner;
         float *g = gated + (size_t)n * inner;
@@ -245,7 +275,7 @@ void taae_med_block_forward(float *xc, int N, int dim, int H, int hd, int inner,
         }
     }
     taae_gemm(o, gated, w->ff_out_w, &w->q_ff_out_w, w->qon, w->ff_out_b, N, inner, dim);
-    for (size_t i = 0; i < (size_t)N * dim; i++) xc[i] = res[i] + o[i];
+    add_inplace(xc, o, (size_t)N * dim);
 
     aria_arena_restore(ar, mark);
 }

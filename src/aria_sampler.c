@@ -5,6 +5,7 @@
 #include "aria_sampler.h"
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 
 /* ---- xoshiro256** ---- */
 static inline uint64_t rotl(uint64_t x, int k) { return (x << k) | (x >> (64 - k)); }
@@ -119,7 +120,22 @@ void aria_rng_randn(aria_rng *r, float *out, int n) {
         for (int i = 0; i < n; i++) out[i] = tmp[i];
         return;
     }
-    for (int i = 0; i < n; i++) out[i] = aria_rng_gaussian(r);
+    /* draw the 2n uniforms in stream order (as n aria_rng_gaussian calls would), then
+     * run the double-precision Box-Muller transforms in parallel: identical values, with
+     * the libm-heavy part off the serial path (the GPU waits on this every step) */
+    uint64_t *u = malloc((size_t)2 * n * sizeof(uint64_t));
+    if (!u) { for (int i = 0; i < n; i++) out[i] = aria_rng_gaussian(r); return; }
+    for (size_t i = 0; i < (size_t)2 * n; i++) u[i] = rng_next(r);
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int i = 0; i < n; i++) {
+        double u1 = (u[2 * (size_t)i] >> 11) * (1.0 / 9007199254740992.0);
+        double u2 = (u[2 * (size_t)i + 1] >> 11) * (1.0 / 9007199254740992.0);
+        if (u1 < 1e-300) u1 = 1e-300;
+        out[i] = (float)(sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265358979323846 * u2));
+    }
+    free(u);
 }
 
 /* ---- schedule ---- */
@@ -137,6 +153,50 @@ void aria_logsnr_schedule(float *out, int steps, float sigma_max,
         out[i] = (float)t_out;
     }
     out[0] = sigma_max;  /* pin first to sigma_max */
+}
+
+void aria_dist_shift_defaults(aria_dist_shift *s, int type) {
+    memset(s, 0, sizeof(*s));
+    s->type = type;
+    s->anchor_length = 2000.0f; s->anchor_logsnr = -6.2f; s->rate = 1.0f; s->logsnr_end = 2.0f;
+    s->base_shift = 0.5f; s->max_shift = 1.15f;
+    s->alpha_min = 1.0f; s->alpha_max = 1.0f;
+    s->min_length = 256.0f; s->max_length = 4096.0f;
+}
+
+void aria_build_schedule(float *out, int steps, float sigma_max,
+                         const aria_dist_shift *s, int seq_len) {
+    if (seq_len < 1) seq_len = 1;
+    if (s->type == ARIA_SHIFT_LOGSNR) {
+        aria_logsnr_schedule(out, steps, sigma_max, s->anchor_logsnr, s->anchor_length,
+                             s->rate, s->logsnr_end, (float)seq_len);
+        return;
+    }
+    double L = seq_len < s->min_length ? s->min_length : seq_len > s->max_length ? s->max_length : seq_len;
+    double em = 1.0, alpha = 1.0;   /* FULL: e^mu; FLUX: alpha (log-linear in seq_len) */
+    if (s->type == ARIA_SHIFT_FULL)
+        em = exp(-(s->base_shift + (s->max_shift - s->base_shift) * (L - s->min_length) /
+                                   (s->max_length - s->min_length)));
+    if (s->type == ARIA_SHIFT_FLUX) {
+        double l0 = log(s->min_length), l1 = log(s->max_length);
+        if (l1 == l0) l1 += 1e-8;
+        double a0 = log(fmax(s->alpha_min, 1e-8)), a1 = log(fmax(s->alpha_max, 1e-8));
+        alpha = exp(a0 + (log(L) - l0) / (l1 - l0) * (a1 - a0));
+    }
+    int N = steps + 1;
+    for (int i = 0; i < N; i++) {
+        double t = (N > 1) ? (double)sigma_max * (1.0 - (double)i / (double)(N - 1)) : (double)sigma_max;
+        double o = t;
+        if (s->type == ARIA_SHIFT_FULL) {
+            /* 1 - e^mu / (e^mu + t/(1-t)); the t->1 limit is 1, t=0 gives 0 */
+            o = t >= 1.0 ? 1.0 : t <= 0.0 ? 0.0 : 1.0 - em / (em + (1.0 / (1.0 - t) - 1.0));
+            if (s->use_sine) o = sin(o * 3.14159265358979323846 / 2.0);
+        } else if (s->type == ARIA_SHIFT_FLUX) {
+            o = alpha * t / (1.0 + (alpha - 1.0) * t);
+        }
+        out[i] = (float)o;
+    }
+    out[0] = sigma_max;
 }
 
 /* ---- pingpong ---- */

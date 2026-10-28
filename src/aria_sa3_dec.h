@@ -49,6 +49,10 @@ void aria_sa3_dec_forward_windowed(const aria_sa3_dec *m, float *out_audio,
                                    const float *latent, int T, int window_frames);
 void aria_sa3_dec_medium_forward_windowed(const aria_sa3_dec_medium *m, float *audio,
                                           const float *latent, int T, int window_frames);
+/* the window (latent frames, >= ~8 s) whose haloed slice fits budget_bytes of decode
+ * memory -- how the runtime sizes the default window from physical RAM */
+int aria_sa3_dec_window_for_budget(size_t budget_bytes);
+int aria_sa3_dec_medium_window_for_budget(size_t budget_bytes);
 
 /* ---- B5 (E14.1) partial-emit range decode ----
  * Decode ONLY latent frames [rStart, rEnd) into out_audio (the full [2,T*4096]
@@ -64,6 +68,7 @@ void aria_sa3_dec_medium_forward_range(const aria_sa3_dec_medium *m, float *audi
 void aria_sa3_softnorm_decode(const aria_sa3_dec *m, float *z, const float *latent, int T); /* z[256,T] */
 void aria_sa3_same_decode(const aria_sa3_dec *m, float *dec, const float *z, int T);        /* dec[512,T*16] */
 void aria_unpatch_stereo(float *audio, const float *dec, int L);                            /* audio[2,L*256] */
+void aria_unpatch_stereo_tm(float *audio, const float *dec_tm, int L);                      /* dec_tm[L,512] */
 
 /* test hook: run transformers[idx] on xc[N,768] in place (rope recomputed for N). */
 void aria_sa3_dec_block_test(const aria_sa3_dec *m, int idx, float *xc, int N);

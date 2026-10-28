@@ -46,6 +46,8 @@ typedef struct {
     aria_dtype precision;
     int do_info, do_list, do_generate, do_stream, inpaint_continue, stream_hold, rng_torch;
     int steps_set, fast;                    /* A1: --fast = 6-step preset unless -s is explicit */
+    int schedule;                           /* P0.1: aria_schedule (0 = runtime default) */
+    float headroom;                         /* P0.3: reference duration_padding_sec (0 = off) */
     int util;                               /* 0 none / 1 wav-roundtrip / 2 hpss-test */
     const char *steer_specs[16]; int n_steer;   /* E12: repeatable --steer site:layer:dir.atns:scale:lo-hi */
     const char *batch_file;                 /* E13: --batch jobs TSV (resident multi-gen) */
@@ -55,8 +57,8 @@ typedef struct {
 
 static cli_config cli_defaults(void) {
     cli_config c = {0};
-    c.out_path = "out.wav"; c.seconds = 15.0f; c.steps = 8; c.bench = 1;
-    c.seed = -1; c.device = ARIA_DEVICE_AUTO; c.precision = ARIA_F32;
+    c.out_path = "out.wav"; c.seconds = 15.0f; c.steps = 0; c.bench = 1;   /* steps 0 = model default */
+    c.seed = -1; c.device = ARIA_DEVICE_AUTO; c.precision = ARIA_DTYPE_AUTO;
     c.stream_chunk = 2.0f; c.stream_context = 6.0f; c.stream_chunks = 8;
     return c;
 }
@@ -66,7 +68,7 @@ enum {   /* keys: short flags use their ASCII char; long-only options use ids pa
     K_SEED=256, K_DEVICE, K_BENCH, K_UNCOND, K_PEMB, K_INFO, K_LIST,
     K_INPAINT, K_CONTINUE, K_FROM, K_TO, K_PREC, K_LOADQ, K_RNG,
     K_STREAM, K_CHUNK, K_CTX, K_CHUNKS, K_HOLD, K_WAVRT, K_HPSS, K_STEER,
-    K_BATCH, K_LORA, K_STEERRAMP, K_ANCHOR, K_EVOLVE, K_FAST,
+    K_BATCH, K_LORA, K_STEERRAMP, K_ANCHOR, K_EVOLVE, K_FAST, K_SCHED, K_HEADROOM,
 };
 typedef enum { A_NONE, A_ONE, A_TWO, A_OPT } argkind;  /* flag / 1 arg / 2 args / optional 1 arg */
 typedef struct {
@@ -83,11 +85,13 @@ static const opt_spec OPTS[] = {
     {K_PEMB,     "prompt-embed",  0,  A_ONE,  "<file>",     "generate", "precomputed prompt embedding (.atns)"},
     {K_UNCOND,   "uncond",        0,  A_NONE, NULL,         "generate", "unconditional generation"},
     {K_DUR,      "",             'd', A_ONE,  "<sec>",      "generate", "duration in seconds (default 15)"},
-    {K_STEPS,    "",             's', A_ONE,  "<n>",        "generate", "denoise steps (default 8)"},
-    {K_FAST,     "fast",          0,  A_NONE, NULL,         "generate", "fast preset: 6 steps (calibrated: taste-drift < seed noise; overridden by -s)"},
+    {K_STEPS,    "",             's', A_ONE,  "<n>",        "generate", "denoise steps (default 6)"},
+    {K_FAST,     "fast",          0,  A_NONE, NULL,         "generate", "6 steps (now the default; kept for compatibility)"},
+    {K_SCHED,    "schedule",      0,  A_ONE,  "<s>",        "generate", "ref (stable_audio_3 generate) | len (legacy length-dependent) | full (TensorRT runtime)"},
+    {K_HEADROOM, "headroom",      0,  A_ONE,  "<sec>",      "generate", "generate <sec> past the duration, then crop (reference uses 6; text->audio only)"},
     {K_SEED,     "seed",          0,  A_ONE,  "<n>",        "generate", "RNG seed (default random)"},
     {K_DEVICE,   "device",        0,  A_ONE,  "<dev>",      "generate", "cpu | cuda | auto (default auto)"},
-    {K_PREC,     "precision",     0,  A_ONE,  "<p>",        "generate", "fp32 | fp16 | bf16 | q8 | q4 (q8/q4 force CPU)"},
+    {K_PREC,     "precision",     0,  A_ONE,  "<p>",        "generate", "auto (default: q8a8 on int8 tensor-core GPUs, else fp32/fp16) | fp32 | fp16 | bf16 | q8 | q8a8 | q4"},
     {K_LOADQ,    "load-quant",    0,  A_ONE,  "<file>",     "generate", "load a pre-quantized .aria DiT overlay"},
     {K_RNG,      "rng",           0,  A_ONE,  "<mode>",     "generate", "xoshiro (default) | torch (parity)"},
     {K_STEER,    "steer",         0,  A_ONE,  "<spec>",     "generate", "steer site:layer:dir.atns:scale:lo-hi[:add|project] (repeatable; CPU+GPU)"},
@@ -128,6 +132,13 @@ static int cli_apply(int key, char **a, cli_config *c) {
     case K_DUR:    c->seconds = (float)atof(a[0]); break;
     case K_STEPS:  c->steps = atoi(a[0]); c->steps_set = 1; break;
     case K_FAST:   c->fast = 1; break;
+    case K_SCHED:
+        if (!strcmp(a[0], "ref")) c->schedule = ARIA_SCHED_REF;
+        else if (!strcmp(a[0], "len")) c->schedule = ARIA_SCHED_LEN;
+        else if (!strcmp(a[0], "full")) c->schedule = ARIA_SCHED_FULL;
+        else { fprintf(stderr, "unknown --schedule %s (use ref|len|full)\n", a[0]); return 1; }
+        break;
+    case K_HEADROOM: c->headroom = (float)atof(a[0]); break;
     case K_SEED:   c->seed = atoll(a[0]); break;
     case K_BENCH:  c->bench = atoi(a[0]); if (c->bench < 1) c->bench = 1; break;
     case K_DEVICE:
@@ -137,7 +148,7 @@ static int cli_apply(int key, char **a, cli_config *c) {
         break;
     case K_PREC:
         if (aria_dtype_parse(a[0], &c->precision) != 0) {
-            fprintf(stderr, "unknown --precision %s (use fp32|fp16|bf16|q8|q4)\n", a[0]); return 1;
+            fprintf(stderr, "unknown --precision %s (use auto|fp32|fp16|bf16|q8|q8a8|q4)\n", a[0]); return 1;
         }
         break;
     case K_LOADQ:  c->load_quant = a[0]; break;
@@ -318,6 +329,7 @@ static int cmd_batch(aria_ctx *ctx, const cli_config *cfg) {
         p.prompt = prompt; p.seconds_total = cfg->seconds; p.steps = cfg->steps;
         p.seed = atoll(seed); p.device = cfg->device; p.precision = cfg->precision;
         p.rng_torch = cfg->rng_torch;
+        p.schedule = cfg->schedule; p.headroom_s = cfg->headroom;
         aria_steer it; aria_steer_set set = { &it, 0 };
         if (strcmp(spec, "-") != 0) {
             if (parse_steer_spec(spec, &it) != 0) { failed++; continue; }
@@ -549,8 +561,10 @@ static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float con
     aria_audio *context = NULL;
 
     const char *devname = p->device == ARIA_DEVICE_CPU ? "CPU" : p->device == ARIA_DEVICE_CUDA ? "CUDA" : "auto";
-    fprintf(stderr, "[stream] emit=%.1fs context=%.1fs (skip %.1f / tail %.1f / xfade %.2f) steps=%d (%s)%s%s%s\n",
-            emit_s, context_s, skip_s, tail_s, xfade_s, p->steps, devname,
+    char stepbuf[16];
+    if (p->steps > 0) snprintf(stepbuf, sizeof stepbuf, "%d", p->steps); else snprintf(stepbuf, sizeof stepbuf, "default");
+    fprintf(stderr, "[stream] emit=%.1fs context=%.1fs (skip %.1f / tail %.1f / xfade %.2f) steps=%s (%s)%s%s%s\n",
+            emit_s, context_s, skip_s, tail_s, xfade_s, stepbuf, devname,
             anchor_beta > 0.0f ? " +anchor" : "", evolve_n > 0 ? " +evolve" : "",
             interactive ? " — type a prompt + Enter to re-steer" : "");
 
@@ -727,6 +741,7 @@ int main(int argc, char **argv) {
         p.prompt = cfg.prompt; p.steps = cfg.steps; p.seed = cfg.seed;
         p.precision = cfg.precision; p.device = cfg.device;  /* GPU continuation supported (sm_70+) */
         p.rng_torch = cfg.rng_torch;
+        p.schedule = cfg.schedule;   /* headroom is text->audio only: chunks are continuations */
         aria_steer steer_items[16]; aria_steer_set steer_set = {0};
         aria_steer *ramp_target = NULL; float ramp_lo = 0, ramp_hi = 0; int ramp_tri = 0;
         if (cfg.n_steer > 0) {
@@ -765,6 +780,8 @@ int main(int argc, char **argv) {
         p.inpaint_to_s = cfg.inpaint_to;
         p.inpaint_continue = cfg.inpaint_continue;
         p.rng_torch = cfg.rng_torch;
+        p.schedule = cfg.schedule;
+        p.headroom_s = cfg.headroom;
         aria_steer steer_items[16]; aria_steer_set steer_set = {0};   /* E12 activation steering */
         if (cfg.n_steer > 0) {
             if (build_steer_set(&cfg, steer_items, &steer_set) != 0) { aria_free(ctx); return 1; }

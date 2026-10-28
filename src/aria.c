@@ -10,6 +10,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <unistd.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* ---- process-wide last error ---- */
 static char g_error[512] = "";
@@ -121,10 +125,42 @@ void aria_list_tensors(const aria_ctx *ctx, const char *prefix) {
     printf("(%d tensors%s%s)\n", shown, prefix ? " under prefix " : "", prefix ? prefix : "");
 }
 
+/* physical cores = distinct SMT sibling sets (0 when the topology is unreadable) */
+static int physical_cores(void) {
+    static int n = -1;
+    if (n >= 0) return n;
+    static char seen[1024][64];
+    int k = 0;
+    long ncpu = sysconf(_SC_NPROCESSORS_CONF);
+    for (long c = 0; c < ncpu && k < 1024; c++) {
+        char path[96], buf[64] = "";
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/topology/thread_siblings_list", c);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;   /* offline / absent cpu */
+        if (!fgets(buf, sizeof buf, f)) buf[0] = 0;
+        fclose(f);
+        int dup = 0;
+        for (int i = 0; i < k && !dup; i++) dup = !strcmp(seen[i], buf);
+        if (!dup) strcpy(seen[k++], buf);
+    }
+    n = k;
+    return n;
+}
+
 int aria_generate(aria_ctx *ctx, const aria_gen_params *p, aria_audio **out) {
     if (!ctx || !ctx->module || !ctx->module->generate) {
         aria_set_error("generate: no module loaded");
         return -1;
     }
+#ifdef _OPENMP
+    /* default team: one thread per physical core -- the GEMMs saturate the FMA ports, so
+     * SMT siblings only contend (measured faster on the i9). Exact: no op reduces across
+     * threads. Set per call: OpenMP team sizes are per calling thread (aria-server
+     * generates on a worker). OMP_NUM_THREADS still wins. */
+    if (!getenv("OMP_NUM_THREADS")) {
+        int pc = physical_cores();
+        if (pc > 0 && pc < omp_get_num_procs()) omp_set_num_threads(pc);
+    }
+#endif
     return ctx->module->generate(ctx, ctx->state, p, out);
 }

@@ -40,6 +40,20 @@ int main(void) {
     int same = 1; for (int i = 0; i < 32; i++) if (xa[i] != xb[i]) same = 0;
     printf("%-4s xoshiro determinism (same seed -> same sequence)\n", same ? "ok" : "FAIL");
     ok &= same;
+    /* the parallel vector fill == n sequential aria_rng_gaussian draws, bit for bit,
+     * including the state it leaves behind */
+    {
+        enum { NV = 4099 };
+        static float va[NV], vb[NV];
+        aria_rng c, d;
+        aria_rng_seed(&c, 777); aria_rng_seed(&d, 777);
+        aria_rng_randn(&c, va, NV);
+        for (int i = 0; i < NV; i++) vb[i] = aria_rng_gaussian(&d);
+        int eq = 1; for (int i = 0; i < NV; i++) if (va[i] != vb[i]) eq = 0;
+        eq &= aria_rng_gaussian(&c) == aria_rng_gaussian(&d);
+        printf("%-4s xoshiro vector fill == sequential draws\n", eq ? "ok" : "FAIL");
+        ok &= eq;
+    }
 
     /* (2) torch-matched mode vs golden torch.randn */
     ok &= check_torch("", 0, TORCH_SEED0);

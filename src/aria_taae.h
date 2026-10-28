@@ -47,18 +47,19 @@ typedef struct {
 void taae_block_quantize(taae_block_w *w, int dim, int inner, aria_dtype dt);
 void taae_block_overlay_free(taae_block_w *w);
 
-/* run one block in place on xc[N,768]; rope tables rcos/rsin[N,16]. All scratch
- * is drawn from `ar` (save/restore-scoped) so the hot path never malloc/frees. */
-void taae_block_forward(float *xc, int N, const taae_block_w *w,
+/* run one block in place on xc[nch*S,768] = nch independent chunks of S tokens
+ * (attention stays inside each chunk; nch = 1: one sequence of S). rope tables
+ * rcos/rsin[S,16]. All scratch comes from `ar` (>= taae_block_arena_bytes(nch*S)). */
+void taae_block_forward(float *xc, int nch, int S, const taae_block_w *w,
                         const float *rcos, const float *rsin, aria_arena *ar);
 
 /* run 3 blocks over seq[L,768] in S=34 chunks; shift=1 adds a midpoint-shift halo.
- * Chunks are independent and run in parallel -- one arena per worker thread. */
+ * Chunks are independent, so blocks run over groups of chunks (batched GEMMs). */
 void taae_chunk_pass(float *x, int L, const taae_block_w *blocks,
-                     const float *rcos, const float *rsin, int shift, aria_arena *arenas);
+                     const float *rcos, const float *rsin, int shift);
 
-/* scratch arena bytes sufficient for one block at chunk size TAAE_S. */
-size_t taae_block_arena_bytes(void);
+/* scratch arena bytes sufficient for one block over `rows` tokens. */
+size_t taae_block_arena_bytes(int rows);
 
 /* ---- medium decoder block (runtime dim; sliding-window + sinusoidal FF) ----
  * Same DyT + differential-attention TransformerBlock as the small-music decoder,

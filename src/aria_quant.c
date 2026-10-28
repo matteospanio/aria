@@ -52,6 +52,8 @@ const char *aria_dtype_name(aria_dtype dt) {
         case ARIA_BF16: return "bf16";
         case ARIA_Q8:   return "q8";
         case ARIA_Q4:   return "q4";
+        case ARIA_Q8A8: return "q8a8";
+        case ARIA_DTYPE_AUTO: return "auto";
         default:        return "?";
     }
 }
@@ -63,6 +65,8 @@ int aria_dtype_parse(const char *s, aria_dtype *out) {
     else if (!strcmp(s, "bf16") || !strcmp(s, "bfloat16")) *out = ARIA_BF16;
     else if (!strcmp(s, "q8") || !strcmp(s, "int8")) *out = ARIA_Q8;
     else if (!strcmp(s, "q4") || !strcmp(s, "int4")) *out = ARIA_Q4;
+    else if (!strcmp(s, "q8a8") || !strcmp(s, "w8a8")) *out = ARIA_Q8A8;
+    else if (!strcmp(s, "auto")) *out = ARIA_DTYPE_AUTO;
     else return -1;
     return 0;
 }
@@ -277,6 +281,8 @@ void aria_q4_quant(uint8_t *q, float *scale, const float *W, int N, int K) {
 /* ---- aria_qweight dispatch ---- */
 
 void aria_qweight_set(aria_qweight *w, const float *W, int N, int K, aria_dtype dt) {
+    w->a8 = (dt == ARIA_Q8A8);   /* Q8A8 = Q8 weights + int8 activations at GEMM time */
+    if (dt == ARIA_Q8A8) dt = ARIA_Q8;
     w->dt = dt; w->N = N; w->K = K; w->f32 = NULL; w->q = NULL; w->scale = NULL;
     if (dt == ARIA_Q8) {
         w->q = malloc(aria_q8_qbytes(N, K));
@@ -314,7 +320,7 @@ void aria_linear_qw(float *y, const float *x, const aria_qweight *w, const float
     static int w8a8 = -1;   /* opt-in int8-activation path, same env knob as the GPU */
     if (w8a8 < 0) w8a8 = getenv("ARIA_W8A8") != NULL;
     if (w->dt == ARIA_Q8) {
-        if (w8a8) aria_linear_q8a8(y, x, (const int8_t *)w->q, w->scale, b, M, w->K, w->N);
+        if (w8a8 || w->a8) aria_linear_q8a8(y, x, (const int8_t *)w->q, w->scale, b, M, w->K, w->N);
         else      aria_linear_q8(y, x, (const int8_t *)w->q, w->scale, b, M, w->K, w->N);
     }
     else if (w->dt == ARIA_Q4) aria_linear_q4(y, x, (const uint8_t *)w->q, w->scale, b, M, w->K, w->N);
@@ -348,6 +354,7 @@ int aria_qweight_read(FILE *f, aria_qweight *w) {
     int32_t hdr[3];
     if (fread(hdr, sizeof(int32_t), 3, f) != 3) return -1;
     w->dt = (aria_dtype)hdr[0]; w->N = hdr[1]; w->K = hdr[2]; w->f32 = NULL; w->q = NULL; w->scale = NULL;
+    w->a8 = 0;
     if (w->dt != ARIA_Q8 && w->dt != ARIA_Q4) return -1;
     uint64_t qb64, ns64;
     if (fread(&qb64, sizeof(uint64_t), 1, f) != 1) return -1;

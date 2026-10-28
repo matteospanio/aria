@@ -2,6 +2,7 @@
 #include "../src/aria_sampler.h"
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
 
 static int fails = 0;
 static void check(const char *n, float got, float want, float tol) {
@@ -43,6 +44,39 @@ int main(void) {
         int mono = 1;
         for (int i = 1; i < 9; i++) if (sched[i] > sched[i-1] + 1e-7f) mono = 0;
         if (!mono) { printf("FAIL schedule not descending\n"); fails++; }
+    }
+    /* P0.1 shifts via aria_build_schedule */
+    {
+        float a[9], b[9];
+        /* LOGSNR == the legacy call, byte-for-byte (the `len` schedule must not move) */
+        aria_dist_shift len; aria_dist_shift_defaults(&len, ARIA_SHIFT_LOGSNR);
+        for (int T = 108; T <= 646; T += 538) {
+            aria_logsnr_schedule(a, 8, 1.0f, -6.2f, 2000.0f, 1.0f, 2.0f, (float)T);
+            aria_build_schedule(b, 8, 1.0f, &len, T);
+            if (memcmp(a, b, sizeof a)) { printf("FAIL len schedule moved at T=%d\n", T); fails++; }
+        }
+        /* reference sampling default LogSNRShift(rate=0): stable_audio_3 8-step values,
+         * identical at every length */
+        static const float ref8[9] = {1.0f, 0.9944f, 0.9845f, 0.9579f, 0.8909f, 0.7455f, 0.5125f, 0.2739f, 0.0f};
+        aria_dist_shift ref = len; ref.rate = 0.0f;
+        aria_build_schedule(a, 8, 1.0f, &ref, 108);
+        aria_build_schedule(b, 8, 1.0f, &ref, 646);
+        for (int i = 0; i < 9; i++) check("ref8", a[i], ref8[i], 1e-4f);
+        if (memcmp(a, b, sizeof a)) { printf("FAIL ref schedule depends on length\n"); fails++; }
+        /* DistributionShift (full): a*t/(1+(a-1)t), a = e^0.5 at L<=256, e^1.15 at 4096 */
+        aria_dist_shift full; aria_dist_shift_defaults(&full, ARIA_SHIFT_FULL);
+        const int Ls[2] = {100, 4096}; const double as[2] = {exp(0.5), exp(1.15)};
+        for (int k = 0; k < 2; k++) {
+            aria_build_schedule(a, 8, 1.0f, &full, Ls[k]);
+            for (int i = 0; i < 9; i++) {
+                double t = 1.0 - i / 8.0, w = as[k] * t / (1.0 + (as[k] - 1.0) * t);
+                check("full", a[i], (float)w, 1e-6f);
+            }
+        }
+        /* flux with alpha 1 is the identity */
+        aria_dist_shift fl; aria_dist_shift_defaults(&fl, ARIA_SHIFT_FLUX);
+        aria_build_schedule(a, 8, 1.0f, &fl, 500);
+        for (int i = 0; i < 9; i++) check("flux_id", a[i], 1.0f - i / 8.0f, 1e-6f);
     }
     /* RNG: gaussian mean ~0, var ~1 */
     {
