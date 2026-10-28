@@ -199,7 +199,9 @@ ssh -N -L 8321:127.0.0.1:8321 gpu-box &                                         
 ./aria-repl --chunk 1 --buffer 1 --record take.wav
 ```
 
-The client and server are POSIX-only for now; the Windows port is in progress.
+The client and server are POSIX-only for now; the Windows port is in progress. **[LIVE.md](LIVE.md)**
+explains the live mode in depth: how the stream is built, buffering and credits, the automatic
+adaptation, the scheduler and caches, and the protocol.
 
 ## Parity and testing
 
@@ -209,6 +211,7 @@ Correctness is checked against the real `stable-audio-tools` PyTorch reference. 
 
 - [AGENTS.md](AGENTS.md) — conventions and ground rules for anyone (human or AI) working in this repo. Read this before changing code.
 - [CONTRIBUTING.md](CONTRIBUTING.md) — the parity and build regression tracks. Read this before sending a pull request.
+- [LIVE.md](LIVE.md) — the live mode (`aria-server` + `aria-repl`): streaming, buffering, automatic adaptation, protocol.
 - [BENCHMARKS.md](BENCHMARKS.md) — measured performance and memory across CPU, CUDA, and the Raspberry Pi 5.
 
 ## Acknowledgements
