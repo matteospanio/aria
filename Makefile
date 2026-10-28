@@ -184,6 +184,7 @@ CUDA_LDFLAGS := -fopenmp -lm -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 
 
 # build the lib (+ aria_cuda.o) and CLI with the CUDA backend linked in
 cuda:
+	@mkdir -p $(BUILD)
 	rm -f $(BUILD)/*.o $(BUILD)/libaria.a aria   # CFLAGS change; keep dumps
 	$(NVCC) -ccbin "$(CUDA_CCBIN)" -arch=$(CUDA_ARCH) -O3 --default-stream per-thread -I$(SRC) -c $(SRC)/aria_cuda.cu -o $(BUILD)/aria_cuda.o
 	$(MAKE) aria CFLAGS="$(CUDA_CFLAGS)" LDFLAGS="$(CUDA_LDFLAGS)" EXTRA_LIB_OBJS="$(BUILD)/aria_cuda.o"
@@ -191,6 +192,7 @@ cuda:
 
 # CUDA op parity vs CPU (skips cleanly if no device)
 test_cuda:
+	@mkdir -p $(BUILD)
 	rm -f $(BUILD)/*.o $(BUILD)/libaria.a
 	$(NVCC) -ccbin "$(CUDA_CCBIN)" -arch=$(CUDA_ARCH) -O3 --default-stream per-thread -I$(SRC) -c $(SRC)/aria_cuda.cu -o $(BUILD)/aria_cuda.o
 	$(MAKE) $(LIB) CFLAGS="$(CUDA_CFLAGS)" EXTRA_LIB_OBJS="$(BUILD)/aria_cuda.o"

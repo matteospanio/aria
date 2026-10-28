@@ -8,7 +8,8 @@
  * editor, commands, status line), the network reader (POST /stream frames -> ring
  * buffer, recording, events) and playback (ring -> an external player's stdin; its
  * blocking writes pace real time). The server keeps about one chunk ahead of what has
- * been played (credits sent from the UI thread), so a change is heard ~a chunk later.
+ * been played (credits the UI thread sends on the stream connection itself), so a change
+ * is heard ~one buffer later; the buffer starts small and grows after each underrun.
  * Playback uses an existing player (pw-play, paplay, aplay, sox play, ffplay) through
  * a pipe -- no audio library.
  */
@@ -58,6 +59,8 @@ static struct {
     /* session */
     int state, quit, sigq, stdin_eof;
     char sid[16]; int sr, ch;
+    aria_sock sock;                      /* the /stream connection (credits go upstream on it) */
+    double buffer, buffer_sent;          /* client buffer target = the server's lookahead, s */
     char open_body[2600];
     float *ring; int64_t ring_cap;       /* frames */
     int64_t recv_end, played, credited;  /* session timeline, frames */
@@ -77,7 +80,7 @@ static struct {
     int wake[2];
     char evq[32][400]; int evn;
 } R = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER, .port = 8321,
-        .latency = 0.25, .seed = -1 };
+        .latency = 0.25, .seed = -1, .sock = ARIA_SOCK_BAD };
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 
@@ -273,6 +276,7 @@ static void *net_main(void *arg) {
         size_t cap = 1 << 22, len = 0; unsigned char *buf = malloc(cap);
         long k; int code = 0, inhdr = 1;
         pthread_mutex_lock(&R.mu);
+        R.sock = ok ? s : ARIA_SOCK_BAD;
         if (!ok) post_event("  %s cannot reach the server at %s:%d", G("✗", "x"), R.host, R.port);
         while (ok && !R.quit) {
             pthread_mutex_unlock(&R.mu);
@@ -341,6 +345,7 @@ static void *net_main(void *arg) {
                         long long seed = aria_json_get_number(js, "seed", &v) == 0 ? (long long)v : -1;
                         double ch_s = aria_json_get_number(js, "chunk", &v) == 0 ? v : 0;
                         double ah = aria_json_get_number(js, "ahead", &v) == 0 ? v : 0;
+                        R.buffer = R.buffer_sent = ah;
                         char pr[512] = "", pe[1100]; aria_json_get_string(R.open_body, "prompt", pr, sizeof pr);
                         aria_json_escape(pr, pe, sizeof pe);
                         hist_line("open", ",\"prompt\":\"%s\",\"seed\":%lld,\"chunk\":%.2f,\"ahead\":%.2f,\"rec_offset\":%.2f",
@@ -363,6 +368,7 @@ static void *net_main(void *arg) {
             }
             if (!ok) break;
         }
+        R.sock = ARIA_SOCK_BAD;
         if (s != ARIA_SOCK_BAD) aria_sock_close(s);
         free(buf);
         R.done_recv = 1;
@@ -404,7 +410,9 @@ static void *play_main(void *arg) {
             if (!silent && R.buffering) { R.buffering = 0; post_event("  %s playing again", G("▶", ">")); }
             if (avail == 0 && !R.paused && !R.buffering && R.state == LIVE && R.played > 0) {
                 R.buffering = 1; R.underruns++;
-                post_event("  %s buffering%s", G("…", "..."), R.underruns == 1 ? " (the server is slower than real time here; a larger --chunk helps)" : "");
+                if (R.buffer < 6.0) R.buffer = R.buffer + 0.5 < 6.0 ? R.buffer + 0.5 : 6.0;   /* adaptive */
+                post_event("  %s buffering %s buffer %.1f s%s", G("…", "..."), G("·", "-"), R.buffer,
+                           R.underruns == 1 && R.rtf > 0 && R.rtf < 1.1 ? " (the server is near or below real time; a larger --chunk helps)" : "");
             }
             int64_t n = silent ? BLOCK : (avail < BLOCK ? avail : BLOCK);
             if (silent) { memset(blk, 0, (size_t)n * ch * sizeof(float)); if (R.buffering) R.silence += n; }
@@ -624,6 +632,7 @@ static void open_stream(const char *prompt) {
     if (R.chunk > 0) k += (size_t)snprintf(extra + k, sizeof extra - k, ",\"chunk\":%.2f", R.chunk);
     if (R.context > 0) k += (size_t)snprintf(extra + k, sizeof extra - k, ",\"context\":%.2f", R.context);
     if (R.ahead >= 0) k += (size_t)snprintf(extra + k, sizeof extra - k, ",\"ahead\":%.2f", R.ahead);
+    R.buffer = 0;   /* HELO reports the server's choice */
     if (R.pre_steer[0]) k += (size_t)snprintf(extra + k, sizeof extra - k, ",\"steer\":\"%s\"", R.pre_steer);
     pthread_mutex_lock(&R.mu);
     snprintf(R.open_body, sizeof R.open_body, "{\"prompt\":\"%s\"%s}", pe, extra);
@@ -755,14 +764,16 @@ static void usage(FILE *f) {
     fputs("aria-repl - interactive client for aria-server live sessions\n\n"
           "Usage: aria-repl [--host 127.0.0.1:8321] [--record take.wav] [--history take.jsonl]\n"
           "                 [--player \"cmd\" | --no-play | --out -] [--chunk s] [--context s]\n"
-          "                 [--ahead s] [--seed n] [--latency s] [--duration s]\n\n"
+          "                 [--buffer s] [--seed n] [--latency s] [--duration s]\n\n"
           "  --record f.wav     save everything received (float WAV, valid even if interrupted)\n"
           "  --history f.jsonl  log every prompt / steer / seed change with when it became audible\n"
           "  --player \"cmd\"     play through cmd ({sr} {ch} are substituted; raw f32 on its stdin);\n"
           "                     default: the first of pw-play, paplay, aplay, play, ffplay found\n"
           "  --no-play          no audio output (recording still works)\n"
           "  --out -            raw f32 to stdout instead of a player (pipe it anywhere)\n"
-          "  --chunk/--context/--ahead  session shape (default: the server's tuned values)\n"
+          "  --buffer s         audio kept ahead of playback (default: one chunk); lower = changes\n"
+          "                     land sooner; it grows by 0.5 s after each underrun\n"
+          "  --chunk/--context  session shape (default: the server's tuned values)\n"
           "  --latency s        player latency estimate for \"lands in\" (default 0.25)\n"
           "  --duration s       stop after s seconds of audio (scripts)\n\n"
           "Then type a prompt. /help lists the commands.\n", f);
@@ -788,7 +799,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--out")) { if (strcmp(v, "-")) { usage(stderr); return 1; } R.to_stdout = 1; i++; }
         else if (!strcmp(a, "--chunk")) { R.chunk = atof(v); i++; }
         else if (!strcmp(a, "--context")) { R.context = atof(v); i++; }
-        else if (!strcmp(a, "--ahead")) { R.ahead = atof(v); i++; }
+        else if (!strcmp(a, "--ahead") || !strcmp(a, "--buffer")) { R.ahead = atof(v); i++; }
         else if (!strcmp(a, "--seed")) { R.seed = atoll(v); R.seed_set = 1; i++; }
         else if (!strcmp(a, "--latency")) { R.latency = atof(v); i++; }
         else if (!strcmp(a, "--duration")) { R.duration = atof(v); i++; }
@@ -894,10 +905,16 @@ int main(int argc, char **argv) {
         ui_flush_events();
         ui_draw();
         pthread_mutex_unlock(&R.mu);
-        if (live && played != credited && t - t_credit >= 0.25) {
-            char body[96], resp[256];
-            snprintf(body, sizeof body, "{\"session\":\"%s\",\"played\":%lld}", sid, (long long)played);
-            if (http("POST", "/stream/control", body, resp, sizeof resp) == 200) { pthread_mutex_lock(&R.mu); R.credited = played; pthread_mutex_unlock(&R.mu); }
+        pthread_mutex_lock(&R.mu);
+        aria_sock sock = R.sock; double buffer = R.buffer; int resend = buffer != R.buffer_sent;
+        pthread_mutex_unlock(&R.mu);
+        if (live && sock != ARIA_SOCK_BAD && (played != credited || resend) && t - t_credit >= 0.1) {
+            unsigned char fr[96]; char js[80];   /* CRED on the stream connection: no new TCP connection */
+            int n = snprintf(js, sizeof js, "{\"played\":%lld,\"ahead\":%.2f}", (long long)played, buffer);
+            live_hdr(fr, "CRED", (uint32_t)n); memcpy(fr + 8, js, (size_t)n);
+            if (aria_send_all(sock, fr, 8 + (size_t)n) == 0) {
+                pthread_mutex_lock(&R.mu); R.credited = played; R.buffer_sent = buffer; pthread_mutex_unlock(&R.mu);
+            }
             t_credit = t;
         }
         if (want_stop) control("stop", NULL, NULL, "\"stop\":true");

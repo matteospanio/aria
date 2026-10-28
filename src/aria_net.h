@@ -55,6 +55,12 @@ static inline long aria_recv(aria_sock s, void *buf, size_t n) {
     return (long)k;
 }
 
+/* non-blocking read: >0 bytes, 0 = the peer closed, -1 = nothing to read now (or error) */
+static inline long aria_recv_nb(aria_sock s, void *buf, size_t n) {
+    ssize_t k = recv(s, buf, n, MSG_DONTWAIT);
+    return k > 0 ? (long)k : k == 0 ? 0 : -1;
+}
+
 /* 1 if the peer has closed its end (orderly shutdown), without consuming data */
 static inline int aria_peer_gone(aria_sock s) {
     char c;

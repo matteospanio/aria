@@ -17,7 +17,7 @@
  *   GET  /info              -> model type / sample rate / channels
  *   GET  /steers            -> the named steering directions loaded with --steer-dir
  *   POST /stream            -> a live session: framed audio + events (see aria_live.h)
- *   POST /stream/control    -> change a live session: prompt, steer, seed, ... and credits
+ *   POST /stream/control    -> change a live session: prompt, steer, seed, ahead, ...
  *   POST /generate          -> audio/wav (float32)
  *     {"prompt":"...", "seconds":10, "steps":8, "seed":11, "steer":"sweet:0.3,sour:0.1"}
  *     named steering is optional; the older single-steer form still works:
@@ -755,12 +755,37 @@ static void handle_stream(aria_sock fd, const char *id, const char *body) {
     static const char hdr[] = "HTTP/1.1 200 OK\r\nContent-Type: application/x-aria-stream\r\n"
                               "Cache-Control: no-store\r\nConnection: close\r\n\r\n";
     int ok = aria_send_all(fd, hdr, sizeof hdr - 1) == 0;
+    unsigned char up[512]; size_t upn = 0;   /* upstream frames from the client (CRED) */
     pthread_mutex_lock(&q.mu);
     while (ok) {
         while (!L->oh && !L->finished) {
             struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += 250000000L; if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-            if (pthread_cond_timedwait(&L->ob_cv, &q.mu, &ts) != 0 && aria_peer_gone(fd)) { ok = 0; break; }
+            ts.tv_nsec += 20000000L; if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            if (pthread_cond_timedwait(&L->ob_cv, &q.mu, &ts) == 0) continue;
+            /* credits arrive on this connection (one-way, no new TCP connection per credit):
+             * CRED {"played":frames[,"ahead":seconds]} */
+            long k = aria_recv_nb(fd, up + upn, sizeof up - upn);
+            if (k == 0) { ok = 0; break; }   /* client gone */
+            if (k > 0) upn += (size_t)k;
+            for (;;) {
+                char tag[5]; const unsigned char *pl; uint32_t pn;
+                long used = live_parse(up, upn, sizeof up - 8, tag, &pl, &pn);
+                if (used < 0) { ok = 0; break; }
+                if (!used) break;
+                if (!strcmp(tag, "CRED")) {
+                    char js[256]; double v;
+                    size_t l = pn < sizeof js - 1 ? pn : sizeof js - 1;
+                    memcpy(js, pl, l); js[l] = 0;
+                    if (aria_json_get_number(js, "played", &v) == 0 && (int64_t)v > L->played) L->played = (int64_t)v;
+                    if (aria_json_get_number(js, "ahead", &v) == 0 && v >= 0 && v <= 60 && (int64_t)(v * L->sr) != L->ahead_fr) {
+                        L->ahead_fr = (int64_t)(v * L->sr);
+                        logline(L->id, "client buffer -> %.2f s", v);
+                    }
+                    pthread_cond_signal(&q.cv);
+                }
+                memmove(up, up + used, upn - (size_t)used); upn -= (size_t)used;
+            }
+            if (!ok) break;
         }
         if (!ok || !L->oh) break;   /* client gone, or finished and drained */
         outf *f = L->oh;

@@ -12,9 +12,12 @@
  *   DONE  JSON  {"reason","frames"}       ERRO  JSON  {"error"}
  * Unknown tags are skipped. Audio and lengths are little-endian (every supported target).
  *
- * Pacing is by credit, not TCP backpressure: the client reports the frames it has played
- * (POST /stream/control {"session","played"}) and the server keeps at most `ahead` frames
- * generated past that.
+ * Upstream, on the same connection, the client sends
+ *   CRED  JSON  {"played":frames[,"ahead":seconds]}
+ * Pacing is by credit, not TCP backpressure: the server keeps at most `ahead` frames
+ * generated past what the client reports played (also accepted as POST /stream/control
+ * {"session","played"}), so a change lands about one `ahead` later. Credits ride the open
+ * stream -- one-way, no TCP connection per credit, which matters through a tunnel.
  */
 #ifndef ARIA_LIVE_H
 #define ARIA_LIVE_H
