@@ -813,8 +813,11 @@ int main(int argc, char **argv) {
     aria_json_get_number(info, "sample_rate", &sr); aria_json_get_number(info, "chunk", &chs); aria_json_get_number(info, "rtf", &rtf);
     (void)v;
     if (isatty(2)) fprintf(stderr, "\n%s\n", aria_banner());
-    fprintf(stderr, "aria live %s %s @ %s:%d %s %.1f kHz %s server %.1f%s real time at %.0f s chunks\n",
-            G("·", "-"), mt, R.host, R.port, G("·", "-"), sr / 1000, G("·", "-"), rtf, G("×", "x"), chs);
+    char speed[96];
+    if (rtf > 0) snprintf(speed, sizeof speed, "server %.1f%s real time at %.0f s chunks", rtf, G("×", "x"), chs);
+    else snprintf(speed, sizeof speed, "%.0f s chunks", chs);
+    fprintf(stderr, "aria live %s %s @ %s:%d %s %.1f kHz %s %s\n",
+            G("·", "-"), mt, R.host, R.port, G("·", "-"), sr / 1000, G("·", "-"), speed);
     fprintf(stderr, "type a prompt to start %s /help for commands\n\n", G("·", "-"));
 
     if (R.tty) {
@@ -915,7 +918,7 @@ int main(int argc, char **argv) {
     rec_patch();
     if (R.rec) fclose(R.rec);
     if (R.hist) fclose(R.hist);
-    fprintf(stderr, "[aria-repl] played %.1f s %s underruns %d (%.1f s) %s lookahead %.2f/%.2f/%.2f s %s %.1f%s %s change lag avg %.1f / max %.1f s\n",
+    if (R.played) fprintf(stderr, "[aria-repl] played %.1f s %s underruns %d (%.1f s) %s lookahead %.2f/%.2f/%.2f s %s %.1f%s %s change lag avg %.1f / max %.1f s\n",
             R.sr ? (double)R.played / R.sr : 0.0, G("·", "-"), R.underruns, R.sr ? (double)R.silence / R.sr : 0.0, G("·", "-"),
             R.ahead_min, R.ahead_n ? R.ahead_sum / R.ahead_n : 0.0, R.ahead_max, G("·", "-"), R.rtf, G("×", "x"), G("·", "-"),
             R.lag_n ? R.lag_sum / R.lag_n : 0.0, R.lag_max);
