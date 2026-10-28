@@ -212,14 +212,13 @@ static float *sa3_build_inpaint_local(aria_ctx *ctx, sa3_state *st,
 
     if (!st->enc_taae) st->enc_taae = aria_sa3_enc_load(ctx->sf);
     if (!st->enc_taae) {
-        aria_set_error("inpaint: taae encoder load failed (continue/inpaint/stream support the "
-                       "small models' SAME-S encoder only)");
+        aria_set_error("inpaint: taae encoder load failed");
         free(audio); return NULL;
     }
     /* the SAME encoder rounds T_patch up to a multiple of 32 -> its latent length is
      * ceil(T/2)*2 (= T for even T, T+1 for odd T), which can exceed the DiT's T; size the
      * buffer to the encoder's actual output so the write fits, then use the first T. */
-    int T_enc = aria_sa3_latent_len(aria_sa3_patch_len(audio_len));
+    int T_enc = aria_sa3_enc_latent_len(st->enc_taae, aria_sa3_patch_len(audio_len));
     float *latent = malloc((size_t)256 * (T_enc > T ? T_enc : T) * sizeof(float));
     aria_sa3_enc_forward(st->enc_taae, latent, audio, audio_len);
     free(audio);

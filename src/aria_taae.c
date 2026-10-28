@@ -282,3 +282,15 @@ void taae_med_block_forward(float *xc, int N, int dim, int H, int hd, int inner,
 
     aria_arena_restore(ar, mark);
 }
+
+void taae_rope_freqs_at(float *cos_t, float *sin_t, int n, int pos0) {
+    const int rh = TAAE_ROT / 2;
+    for (int i = 0; i < rh; i++) {
+        double inv = 1.0 / pow(10000.0, (double)(2 * i) / (double)TAAE_ROT);
+        for (int p = 0; p < n; p++) {
+            double ang = (double)(pos0 + p) * inv;
+            cos_t[(size_t)p * rh + i] = (float)cos(ang);
+            sin_t[(size_t)p * rh + i] = (float)sin(ang);
+        }
+    }
+}

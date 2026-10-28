@@ -370,11 +370,21 @@ def dump_dit_full(model_dir, out_dir):
 
 def _load_decoder_ae(model_dir):
     from safetensors.torch import load_file
-    from stable_audio_tools.models.autoencoders import create_autoencoder_from_config
     cfg = json.load(open(os.path.join(model_dir, "model_config.json")))
-    ae_cfg = cfg["model"]["pretransform"]["config"]
-    ae = create_autoencoder_from_config(
-        {"model": ae_cfg, "sample_rate": cfg["sample_rate"]}).eval()
+    try:
+        from stable_audio_tools.models.autoencoders import create_autoencoder_from_config
+        ae_cfg = cfg["model"]["pretransform"]["config"]
+        ae = create_autoencoder_from_config(
+            {"model": ae_cfg, "sample_rate": cfg["sample_rate"]}).eval()
+    except ImportError:
+        # the official stable_audio_3 package; keep its attention in fp32 on the CPU:
+        # flash_attn (CUDA, fp16) and compiled flex attention are disabled, leaving its
+        # math-equivalent chunked-halo SDPA for the sliding-window (medium) blocks
+        import stable_audio_3.models.transformer as sa3t
+        from stable_audio_3.factory import create_autoencoder_from_config
+        sa3t.flash_attn_func = sa3t.flash_attn_varlen_func = None
+        sa3t.flex_attention_compiled = None
+        ae = create_autoencoder_from_config(cfg["model"], cfg["sample_rate"]).eval()
     sd = load_file(os.path.join(model_dir, "model.safetensors"))
     prefix = "pretransform.model."
     ae_sd = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
@@ -466,13 +476,14 @@ def dump_decoder(model_dir, out_dir):
     print(f"dumped taae decoder stages to {d} (T={T})")
 
 
-def dump_encoder(model_dir, out_dir):
+def dump_encoder(model_dir, out_dir, sub="enc"):
     """Staged taae_v2 encode reference (patchify -> SAMEEncoder -> softnorm).
-    Mirror of dump_decoder. Two cases: a clean length (T_patch a multiple of 32)
-    with staged intermediates, and a short length that exercises the encoder's
-    zero-pad-to-multiple-of-32 path (full encode only)."""
+    Mirror of dump_decoder. Three cases: a clean length (T_patch 256) with staged
+    intermediates, a short length that exercises the zero-pad path (T_patch 250), and
+    an odd one (T_patch 270: 18 latent frames for SAME-S, 17 for SAME-L). Use
+    sub="enc_medium" for the medium model."""
     ae = _load_decoder_ae(model_dir)   # loads the full AE, incl. the encoder
-    d = os.path.join(out_dir, "enc")
+    d = os.path.join(out_dir, sub)
     os.makedirs(d, exist_ok=True)
 
     orig_randn_like = torch.randn_like
@@ -481,11 +492,13 @@ def dump_encoder(model_dir, out_dir):
         torch.manual_seed(0)
         audio = torch.randn(1, 2, 16 * 4096)          # T_patch=256 (multiple of 32)
         audio_pad = torch.randn(1, 2, 250 * 256)      # T_patch=250 -> pad to 256
+        audio_odd = torch.randn(1, 2, 270 * 256)      # T_patch=270 -> 288 (S) / 272 (L)
         with torch.no_grad():
             patches = ae.pretransform.encode(audio)
             enc = ae.encoder(patches)
             latent = ae.bottleneck.encode(enc)
             latent_pad = ae.bottleneck.encode(ae.encoder(ae.pretransform.encode(audio_pad)))
+            latent_odd = ae.bottleneck.encode(ae.encoder(ae.pretransform.encode(audio_odd)))
     finally:
         torch.randn_like = orig_randn_like
 
@@ -495,6 +508,8 @@ def dump_encoder(model_dir, out_dir):
     save_atns(os.path.join(d, "latent.atns"), latent.squeeze(0).float().cpu().numpy())
     save_atns(os.path.join(d, "audio_pad.atns"), audio_pad.squeeze(0).float().cpu().numpy())
     save_atns(os.path.join(d, "latent_pad.atns"), latent_pad.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "audio_odd.atns"), audio_odd.squeeze(0).float().cpu().numpy())
+    save_atns(os.path.join(d, "latent_odd.atns"), latent_odd.squeeze(0).float().cpu().numpy())
     print(f"dumped taae encoder stages to {d} "
           f"(patches {tuple(patches.shape)}, latent {tuple(latent.shape)}, "
           f"pad latent {tuple(latent_pad.shape)})")
@@ -688,6 +703,9 @@ if __name__ == "__main__":
     model_dir = sys.argv[1]
     out_dir = sys.argv[2] if len(sys.argv) > 2 else "parity_dumps"
     os.makedirs(out_dir, exist_ok=True)
+    if len(sys.argv) > 3 and sys.argv[3] == "encoder_medium":   # medium SAME-L encoder only
+        dump_encoder(model_dir, out_dir, sub="enc_medium")
+        sys.exit(0)
     dump_number_cond(model_dir, out_dir)
     dump_ops(out_dir)
     dump_dit_block(model_dir, out_dir)

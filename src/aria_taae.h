@@ -71,5 +71,9 @@ void taae_med_block_forward(float *xc, int N, int dim, int H, int hd, int inner,
                             int win, int sinusoidal, aria_arena *ar);
 /* scratch floats for one medium block at sequence length N (dim/inner runtime). */
 size_t taae_med_block_floats(int N, int dim, int inner);
+/* RoPE tables (base 10000, TAAE_ROT rotated dims) for n tokens at absolute positions
+ * pos0.. -- a window carries its tokens' true global phase, so a windowed pass over a
+ * banded sequence is byte-identical to the whole-sequence pass. cos/sin[n, TAAE_ROT/2]. */
+void taae_rope_freqs_at(float *cos_t, float *sin_t, int n, int pos0);
 
 #endif /* ARIA_TAAE_H */

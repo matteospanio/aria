@@ -1,8 +1,9 @@
 /*
  * aria_sa3_enc.c - taae_v2 encoder (CPU). See aria_sa3_enc.h for the spec.
- * Mirror of aria_sa3_dec.c; the transformer block + chunk pass are shared
- * (aria_taae.{c,h}). The encode is a one-time op (continue/inpaint), not the
- * denoise hot loop, so it favors clarity over the decoder's arena plumbing.
+ * Mirror of the decoders: SAME-S (small, 768-d) shares the chunked block pass with
+ * aria_sa3_dec.c, SAME-L (medium, 1536-d) the sliding-window block with
+ * aria_sa3_dec_medium.c (aria_taae.{c,h}). The encode runs once per continue /
+ * inpaint (or stream chunk), not in the denoise loop.
  */
 
 #include "aria_sa3_enc.h"
@@ -21,14 +22,25 @@
 #define ENC_LAT 256   /* latent dim */
 #define PATCH   256   /* patch_size */
 
+/* SAME-L (medium): one resampling block of 12 sliding-window transformer blocks */
+#define MED_D      1536
+#define MED_DEPTH  12
+#define MED_H      24
+#define MED_HD     64
+#define MED_INNER  4608
+#define MED_WIN    17    /* band half-width, tokens */
+#define MED_HALO   12    /* receptive field, latent frames: 12 blocks * 17 tokens / 17 per frame */
+#define MED_WINDOW 128   /* latent frames per encode window (+2 halos) */
+
 struct aria_sa3_enc {
+    int dim, depth, medium;              /* 768/6 SAME-S, 1536/12 SAME-L */
     const float *scaling_factor, *bias;  /* softnorm, [256] each (borrowed) */
     float running_std;
-    float *mapping_w;                    /* folded WNConv1d [768,512] (owned) */
-    const float *mapping_b;              /* [768] */
-    const float *new_tokens;             /* [768] */
-    taae_block_w blocks[6];
-    const float *proj_w, *proj_b;        /* layers.2 Linear [256,768],[256] */
+    float *mapping_w;                    /* folded WNConv1d [dim,512] (owned) */
+    const float *mapping_b;              /* [dim] */
+    const float *new_tokens;             /* [dim] */
+    taae_block_w blocks[MED_DEPTH];
+    const float *proj_w, *proj_b;        /* layers.2 Linear [256,dim],[256] */
     int failed;
 };
 
@@ -41,6 +53,9 @@ static void transpose_tc_ct(float *dst, const float *src, int T, int C) {
 
 int aria_sa3_patch_len(int L)        { return (L + PATCH - 1) / PATCH; }
 int aria_sa3_latent_len(int T_patch) { return ((T_patch + 31) / 32 * 32) / 16; }
+int aria_sa3_enc_latent_len(const aria_sa3_enc *m, int T_patch) {   /* SAME-L pads to 16, SAME-S to 32 */
+    return m->medium ? (T_patch + 15) / 16 : aria_sa3_latent_len(T_patch);
+}
 
 void aria_sa3_patchify(float *patches, const float *audio, int L, int T_patch) {
     /* patches[c*256+h, t] = audio[c, t*256+h]; channels-first audio[2,L]; pad tail with 0 */
@@ -61,7 +76,63 @@ void aria_sa3_softnorm_encode(const aria_sa3_enc *m, float *latent, const float 
     }
 }
 
+/* SAME-L over latent frames [A,B): mapped[Tpp,1536] token-major (16 per frame) ->
+ * feat rows [A,B) of feat[T,1536]. The sequence carries absolute RoPE positions
+ * (pos0 = A*17), so a haloed window reproduces the whole-sequence pass exactly. */
+static void med_encode_slice(const aria_sa3_enc *m, float *feat, const float *mapped, int A, int B) {
+    const int D = MED_D, G = B - A, N = G * 17;
+    float *seq = malloc((size_t)N * D * sizeof(float));
+    for (int g = 0; g < G; g++) {   /* per frame: its 16 patch tokens + the learned new token */
+        memcpy(seq + (size_t)(g * 17) * D, mapped + (size_t)(A + g) * 16 * D, (size_t)16 * D * sizeof(float));
+        memcpy(seq + (size_t)(g * 17 + 16) * D, m->new_tokens, (size_t)D * sizeof(float));
+    }
+    float *rc = malloc((size_t)N * (TAAE_ROT / 2) * sizeof(float));
+    float *rs = malloc((size_t)N * (TAAE_ROT / 2) * sizeof(float));
+    taae_rope_freqs_at(rc, rs, N, A * 17);
+    aria_arena ar;
+    aria_arena_init(&ar, taae_med_block_floats(N, D, MED_INNER) * sizeof(float));
+    for (int b = 0; b < MED_DEPTH; b++)   /* no sinusoidal FF in the encoder */
+        taae_med_block_forward(seq, N, D, MED_H, MED_HD, MED_INNER, &m->blocks[b], rc, rs, MED_WIN, 0, &ar);
+    aria_arena_free(&ar);
+    free(rc); free(rs);
+    for (int g = 0; g < G; g++)   /* the new token (last of each group) carries the frame */
+        memcpy(feat + (size_t)(A + g) * D, seq + (size_t)(g * 17 + 16) * D, (size_t)D * sizeof(float));
+    free(seq);
+}
+
+void aria_sa3_same_encode_win(const aria_sa3_enc *m, float *enc, const float *patches,
+                              int T_patch, int T_lat, int window_frames) {
+    const int D = MED_D, Tpp = T_lat * 16;   /* T_patch zero-padded to a multiple of 16 */
+    /* WNConv1d k1 mapping 512->1536 (+bias, also on the padding) as a token-major GEMM */
+    float *pt = calloc((size_t)Tpp * ENC_IN, sizeof(float));
+    for (int c = 0; c < ENC_IN; c++)
+        for (int t = 0; t < T_patch; t++) pt[(size_t)t * ENC_IN + c] = patches[(size_t)c * T_patch + t];
+    float *mapped = malloc((size_t)Tpp * D * sizeof(float));
+    aria_linear(mapped, pt, m->mapping_w, m->mapping_b, Tpp, ENC_IN, D);
+    free(pt);
+    float *feat = malloc((size_t)T_lat * D * sizeof(float));
+    int W = window_frames > 0 ? window_frames : MED_WINDOW, H = MED_HALO;
+    if (T_lat <= W + 2 * H) med_encode_slice(m, feat, mapped, 0, T_lat);
+    else {
+        float *wf = malloc((size_t)T_lat * D * sizeof(float));
+        for (int start = 0; start < T_lat; start += W) {
+            int end = start + W < T_lat ? start + W : T_lat;
+            int A = start - H > 0 ? start - H : 0, B = end + H < T_lat ? end + H : T_lat;
+            med_encode_slice(m, wf, mapped, A, B);   /* rows [A,B) of wf; keep [start,end) */
+            memcpy(feat + (size_t)start * D, wf + (size_t)start * D, (size_t)(end - start) * D * sizeof(float));
+        }
+        free(wf);
+    }
+    free(mapped);
+    float *proj = malloc((size_t)T_lat * ENC_LAT * sizeof(float));   /* Linear 1536->256 */
+    aria_linear(proj, feat, m->proj_w, m->proj_b, T_lat, D, ENC_LAT);
+    free(feat);
+    transpose_tc_ct(enc, proj, T_lat, ENC_LAT);
+    free(proj);
+}
+
 void aria_sa3_same_encode(const aria_sa3_enc *m, float *enc, const float *patches, int T_patch, int T_lat) {
+    if (m->medium) { aria_sa3_same_encode_win(m, enc, patches, T_patch, T_lat, 0); return; }
     const int D = TAAE_D;
     int Tpp = T_lat * 16;   /* T_patch zero-padded to a multiple of 32 */
 
@@ -112,7 +183,7 @@ void aria_sa3_same_encode(const aria_sa3_enc *m, float *enc, const float *patche
 
 int aria_sa3_enc_forward(const aria_sa3_enc *m, float *latent, const float *audio, int L) {
     int T_patch = aria_sa3_patch_len(L);
-    int T_lat = aria_sa3_latent_len(T_patch);
+    int T_lat = aria_sa3_enc_latent_len(m, T_patch);
     float *patches = malloc((size_t)ENC_IN * T_patch * sizeof(float));
     aria_sa3_patchify(patches, audio, L, T_patch);
     float *enc = malloc((size_t)ENC_LAT * T_lat * sizeof(float));
@@ -137,16 +208,17 @@ static float track_scalar(aria_sa3_enc *m, safetensors_file_t *sf, const char *n
 }
 
 aria_sa3_enc *aria_sa3_enc_load(safetensors_file_t *sf) {
-    /* only the 768-d SAME-S encoder is implemented; medium ships the 1536-d SAME-L one,
-     * whose tensors share these names -- reading them as 768-d would encode garbage */
+    /* SAME-S (small, 768-d, 6 blocks) and SAME-L (medium, 1536-d, 12 blocks) share the
+     * tensor names; the new_tokens width tells them apart */
     const safetensor_t *nt = safetensors_find(sf, "pretransform.model.encoder.layers.0.new_tokens");
-    if (nt && nt->ndim >= 1 && nt->shape[nt->ndim - 1] != TAAE_D) {
-        fprintf(stderr, "aria_sa3_enc_load: encoder is %lld-d; only the %d-d SAME-S encoder is implemented\n",
-                (long long)nt->shape[nt->ndim - 1], TAAE_D);
+    long long dim = nt && nt->ndim >= 1 ? (long long)nt->shape[nt->ndim - 1] : 0;
+    if (dim != TAAE_D && dim != MED_D) {
+        fprintf(stderr, "aria_sa3_enc_load: unsupported encoder width %lld (SAME-S %d, SAME-L %d)\n", dim, TAAE_D, MED_D);
         return NULL;
     }
     aria_sa3_enc *m = calloc(1, sizeof(*m));
     if (!m) return NULL;
+    m->dim = (int)dim; m->medium = dim == MED_D; m->depth = m->medium ? MED_DEPTH : 6;
 
     m->scaling_factor = track(m, sf, "pretransform.model.bottleneck.scaling_factor");  /* [1,256,1] */
     m->bias = track(m, sf, "pretransform.model.bottleneck.bias");                       /* [1,256,1] */
@@ -157,7 +229,7 @@ aria_sa3_enc *aria_sa3_enc_load(safetensors_file_t *sf) {
 
     char nm[256];
     #define P "pretransform.model.encoder.layers.0.transformers.%d."
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < m->depth; i++) {
         taae_block_w *b = &m->blocks[i];
         #define SCA(dst, suf) do { snprintf(nm, sizeof(nm), P suf, i); dst = track_scalar(m, sf, nm); } while (0)
         #define PTR(dst, suf) do { snprintf(nm, sizeof(nm), P suf, i); dst = track(m, sf, nm); } while (0)
@@ -180,8 +252,8 @@ aria_sa3_enc *aria_sa3_enc_load(safetensors_file_t *sf) {
     m->mapping_b = track(m, sf, "pretransform.model.encoder.layers.0.mapping.bias");          /* [768] */
     if (!m->failed) {
         int rowlen = ENC_IN * 1;
-        float *fw = malloc((size_t)TAAE_D * rowlen * sizeof(float));
-        for (int o = 0; o < TAAE_D; o++) {
+        float *fw = malloc((size_t)m->dim * rowlen * sizeof(float));
+        for (int o = 0; o < m->dim; o++) {
             double ss = 0.0;
             const float *vr = vv + (size_t)o * rowlen;
             for (int idx = 0; idx < rowlen; idx++) ss += (double)vr[idx] * vr[idx];

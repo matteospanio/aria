@@ -140,17 +140,7 @@ void aria_sa3_dec_medium_get_view(const aria_sa3_dec_medium *m, aria_sa3_dec_med
  * aria_rope_freqs (base 10000, TAAE_ROT rotated dims); byte-identical to it when
  * pos0 == 0. The offset lets a decode window carry its tokens' true global rotary
  * phase so band attention matches the monolithic decode bit-for-bit (E16.1). */
-static void med_rope_freqs_at(float *cos_t, float *sin_t, int n, int pos0) {
-    const int rh = TAAE_ROT / 2;
-    for (int i = 0; i < rh; i++) {
-        double inv = 1.0 / pow(10000.0, (double)(2 * i) / (double)TAAE_ROT);
-        for (int p = 0; p < n; p++) {
-            double ang = (double)(pos0 + p) * inv;
-            cos_t[(size_t)p * rh + i] = (float)cos(ang);
-            sin_t[(size_t)p * rh + i] = (float)sin(ang);
-        }
-    }
-}
+#define med_rope_freqs_at taae_rope_freqs_at   /* shared with the medium encoder */
 
 /* decode latent[256,T] -> audio[2, T*4096]; the seq's first token sits at absolute
  * rope position pos0 (= 0 for a monolithic decode, = A*17 for the window [A,B)). */
