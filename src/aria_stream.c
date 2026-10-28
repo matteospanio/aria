@@ -282,6 +282,18 @@ void aria_stream_set_anchor(aria_stream *s, float beta) {
     s->recapture = 1;
 }
 
+int aria_stream_set_chunk(aria_stream *s, float chunk_s) {
+    if (!(chunk_s > 0.0f)) return -1;
+    int64_t need = s->keep + (int64_t)((s->cfg.context_s + chunk_s) * s->sr) + s->maxlag + s->sr;
+    if (need > s->cap) {   /* the timeline tail must hold the longer chunk */
+        float *d = realloc(s->outp->data, (size_t)need * s->ch * sizeof(float));
+        if (!d) { aria_set_error("stream: OOM"); return -1; }
+        s->outp->data = d; s->outp->num_frames = need; s->cap = need;
+    }
+    s->cfg.chunk_s = chunk_s;
+    return 0;
+}
+
 void aria_stream_close(aria_stream *s) {
     if (!s) return;
     aria_audio_free(s->outp); aria_audio_free(s->context); aria_audio_free(s->anchor);

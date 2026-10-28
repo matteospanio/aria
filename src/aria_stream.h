@@ -64,6 +64,9 @@ int64_t aria_stream_seed(const aria_stream *s);
 void aria_stream_set_seed(aria_stream *s, int64_t seed);   /* next chunk; restarts --evolve */
 void aria_stream_set_evolve(aria_stream *s, int n);
 void aria_stream_set_anchor(aria_stream *s, float beta);   /* re-captures the reference next chunk */
+/* emit `chunk_s` seconds per chunk from the next chunk on (a slow machine streams in real
+ * time with longer chunks: the context/seam/tail overhead per chunk is fixed). <0 = OOM. */
+int aria_stream_set_chunk(aria_stream *s, float chunk_s);
 void aria_stream_close(aria_stream *s);
 
 #ifdef __cplusplus

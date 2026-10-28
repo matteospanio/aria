@@ -359,6 +359,8 @@ typedef struct live {
     int64_t seed; int evolve; float anchor; int dirty;
     int ctl, stop, closing;
     int busy, chunks, ended, finished;    /* progress; finished = DONE is queued */
+    float chunk_min, chunk;               /* requested chunk (the floor) / current, adapted */
+    double rtf_ema;                       /* measured real-time factor of continuation chunks */
     int64_t sent, played;
     double est_gen, t0;
     outf *oh, *ot; size_t ob_bytes;
@@ -477,13 +479,37 @@ static void live_chunk(live *L) {   /* q.mu held (released while generating) */
     L->chunks++;
     L->est_gen = L->chunks == 1 ? st.gen_s : 0.7 * L->est_gen + 0.3 * st.gen_s;
     if (st.win_s > 0) rate_update(st.gen_s / st.win_s);
+    /* adapt the chunk to the measured speed: each chunk regenerates a fixed context/seam/
+     * tail around what it emits, so a machine below real time catches up with longer
+     * chunks (at the price of changes landing later); with headroom it shrinks back */
+    float new_chunk = L->chunk;
+    if (st.chunk > 0 && st.gen_s > 0) {
+        double r = st.emit_s / st.gen_s;
+        L->rtf_ema = L->rtf_ema > 0 ? 0.6 * L->rtf_ema + 0.4 * r : r;
+        if ((L->rtf_ema < 1.15 && L->chunk < 10.0f) || (L->rtf_ema > 1.6 && L->chunk > L->chunk_min)) {
+            /* the cost scales with the window, so this chunk predicts every size: take the
+             * smallest (>= the requested one) reaching 1.15x going up, 1.3x coming down */
+            static const float ladder[] = { 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 10.0f };
+            double per_win = st.gen_s / st.win_s, want = L->rtf_ema < 1.15 ? 1.15 : 1.3;
+            new_chunk = 10.0f;
+            for (int i = 0; i < 7; i++) {
+                float c = ladder[i];
+                if (c < L->chunk_min) continue;
+                if (c / (per_win * (L->cfg.context_s + ARIA_STREAM_SKIP_S + c + ARIA_STREAM_TAIL_S)) >= want) { new_chunk = c; break; }
+            }
+        }
+    }
+    if (new_chunk != L->chunk && aria_stream_set_chunk(L->s, new_chunk) == 0) {
+        logline(L->id, "chunk %.0f -> %.0f s (%.2fx real time)", L->chunk, new_chunk, L->rtf_ema);
+        L->chunk = new_chunk; L->emit_fr = (int64_t)(new_chunk * L->sr); L->rtf_ema = 0;
+    }
     double ahead = (double)(L->sent - L->played) / L->sr, rtf = st.gen_s > 0 ? st.emit_s / st.gen_s : 0.0;
     char sd[256], json[640], at[16];
     steer_desc(sc, sd, sizeof sd);
     snprintf(json, sizeof json, "{\"chunk\":%d,\"at\":%lld,\"end\":%lld,\"gen_ms\":%d,\"rtf\":%.2f,\"ahead_ms\":%d,"
-             "\"seed\":%lld,\"ctl\":%d,\"prompt_id\":%d,\"steer\":\"%s\"}",
+             "\"seed\":%lld,\"ctl\":%d,\"prompt_id\":%d,\"steer\":\"%s\",\"chunk_s\":%.1f}",
              st.chunk, (long long)st.start, (long long)L->sent, (int)(st.gen_s * 1000), rtf, (int)(ahead * 1000),
-             (long long)st.seed, ctl, pid, sd);
+             (long long)st.seed, ctl, pid, sd, L->chunk);
     outf *f = frame_json("EVNT", json); ob_append(L, f, f);
     fmt_t(at, sizeof at, st.start, L->sr);
     logline(L->id, "chunk %d at=%s +%.2fs gen=%dms rtf=%.1fx ahead=%.2fs prompt#%d seed=%lld steer=%s",
@@ -532,7 +558,11 @@ static void *worker_main(void *arg) {
         for (L = g_live; L; L = L->next) {
             double slack = (double)(L->sent - L->played) / L->sr - L->est_gen;
             if (slack < min_slack) min_slack = slack;
-            if (live_gate(L->sent, L->played, L->ahead_fr, L->ob_bytes, OB_MAX) && slack < best) { best = slack; pick = L; }
+            /* a chunk is only heard once fully generated: keep at least its generation
+             * time (+25 %, +0.5 s) buffered, whatever the client asked for */
+            int64_t need = (int64_t)((L->est_gen * 1.25 + 0.5) * L->sr);
+            int64_t ahead = L->ahead_fr > 0 && L->ahead_fr < need ? need : L->ahead_fr;
+            if (live_gate(L->sent, L->played, ahead, L->ob_bytes, OB_MAX) && slack < best) { best = slack; pick = L; }
         }
         job *j = q.head;
         if (j && (now_s() - j->t_queued > g_max_wait ||
@@ -679,8 +709,8 @@ static void probe_capacity(aria_ctx *ctx, const worker_cfg *w, int sessions_set)
     }
     aria_stream_close(s);
     double r = st.gen_s / st.win_s;   /* compute seconds per second of window */
-    static const float ladder[] = { 2.0f, 3.0f, 4.0f, 6.0f };
-    for (int i = 0; i < 4; i++) {
+    static const float ladder[] = { 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 10.0f };
+    for (int i = 0; i < 6; i++) {
         float c = ladder[i];
         g_chunk = c;
         g_probe_rtf = c / (r * (cfg.context_s + ARIA_STREAM_SKIP_S + c + ARIA_STREAM_TAIL_S));
@@ -728,6 +758,7 @@ static void handle_stream(aria_sock fd, const char *id, const char *body) {
     L->base = base; L->cfg = cfg;
     L->sr = aria_sample_rate(g_ctx); L->ch = aria_audio_channels(g_ctx);
     L->ahead_fr = (int64_t)(ahead * L->sr); L->emit_fr = (int64_t)(chunk * L->sr);
+    L->chunk = L->chunk_min = chunk;
     L->prompt_id = 1; L->refs = 2;
     pthread_cond_init(&L->ob_cv, NULL);
 

@@ -61,6 +61,7 @@ static struct {
     char sid[16]; int sr, ch;
     aria_sock sock;                      /* the /stream connection (credits go upstream on it) */
     double buffer, buffer_sent;          /* client buffer target = the server's lookahead, s */
+    double chunk_s;                      /* the server's current chunk length */
     char open_body[2600];
     float *ring; int64_t ring_cap;       /* frames */
     int64_t recv_end, played, credited;  /* session timeline, frames */
@@ -242,6 +243,10 @@ static void on_evnt(const char *j) {   /* R.mu held */
         R.ahead_sum += a; R.ahead_n++;
     }
     aria_json_get_string(j, "steer", steer, sizeof steer);
+    if (aria_json_get_number(j, "chunk_s", &v) == 0 && R.chunk_s > 0 && v != R.chunk_s)
+        post_event("  %s server chunk %.0f %s %.0f s (%s)", G("~", "~"), R.chunk_s, G("→", "->"), v,
+                   v > R.chunk_s ? "below real time: changes land later" : "headroom: changes land sooner");
+    if (aria_json_get_number(j, "chunk_s", &v) == 0) R.chunk_s = v;
     R.chunks++;
     if (R.naud == 16) { memmove(R.aud, R.aud + 1, 15 * sizeof R.aud[0]); R.naud = 15; }
     R.aud[R.naud].at = at; snprintf(R.aud[R.naud].steer, sizeof R.aud[0].steer, "%s", steer); R.naud++;
@@ -346,6 +351,7 @@ static void *net_main(void *arg) {
                         double ch_s = aria_json_get_number(js, "chunk", &v) == 0 ? v : 0;
                         double ah = aria_json_get_number(js, "ahead", &v) == 0 ? v : 0;
                         R.buffer = R.buffer_sent = ah;
+                        R.chunk_s = ch_s;
                         char pr[512] = "", pe[1100]; aria_json_get_string(R.open_body, "prompt", pr, sizeof pr);
                         aria_json_escape(pr, pe, sizeof pe);
                         hist_line("open", ",\"prompt\":\"%s\",\"seed\":%lld,\"chunk\":%.2f,\"ahead\":%.2f,\"rec_offset\":%.2f",

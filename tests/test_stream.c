@@ -112,6 +112,22 @@ int main(void) {
         { printf("FAIL random seed (%lld, %lld)\n", (long long)lr.seeds[0], (long long)lr2.seeds[0]); fails++; }
     free(r.buf); free(r2.buf);
 
+    {   /* set_chunk: longer chunks from the next one on, output stays contiguous */
+        fake_log lc = {0};
+        aria_gen_params base = ARIA_GEN_PARAMS_DEFAULT; base.seed = 9;
+        aria_stream_cfg cfg = ARIA_STREAM_CFG_DEFAULT;
+        cfg.generate = fake_generate; cfg.user = &lc; cfg.sample_rate = SR; cfg.channels = CH;
+        aria_stream *st = aria_stream_open(NULL, &base, &cfg);
+        const float *x; aria_stream_stats ss; int64_t expect = 0; int ok = st != NULL;
+        for (int i = 0; ok && i < 5; i++) {
+            if (i == 2 && aria_stream_set_chunk(st, 6.0f) != 0) ok = 0;
+            if (aria_stream_next(st, "p", NULL, &x, &ss) != 0 || ss.start != expect) ok = 0;
+            expect += ss.frames;
+        }
+        if (!ok || fabsf(lc.win[2] - 16.5f) > 1e-6f || fabsf(lc.win[1] - 12.5f) > 1e-6f) { printf("FAIL set_chunk\n"); fails++; }
+        aria_stream_close(st);
+    }
+
     acc h = {0}; fake_log lh = {0};
     fails += run(5, 1, 0, 1, 3, &h, &lh);   /* hold: loop set at chunk 0, reset at the new prompt */
 
