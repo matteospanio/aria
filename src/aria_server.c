@@ -657,6 +657,43 @@ static void handle_generate(aria_sock fd, const char *id, const char *body) {
 }
 
 static const worker_cfg *g_wcfg;   /* defaults for live sessions (device, steps) */
+static float g_chunk = 2.0f;       /* default session chunk (seconds), tuned by the probe */
+static double g_probe_rtf;         /* the probe's predicted real-time factor at g_chunk (0 = no probe) */
+
+/* Capacity probe (before listening): one warm-up chunk and one timed continuation chunk.
+ * The cost of a chunk scales with its window (context + skip + chunk + tail), so one
+ * measurement predicts the real-time factor of every chunk size: the default is the
+ * smallest in the ladder reaching 1.25x real time, and --max-sessions defaults to how
+ * many such streams fit. */
+static void probe_capacity(aria_ctx *ctx, const worker_cfg *w, int sessions_set) {
+    aria_gen_params base = ARIA_GEN_PARAMS_DEFAULT;
+    base.seed = 1; base.steps = w->default_steps; base.device = w->device;
+    aria_stream_cfg cfg = ARIA_STREAM_CFG_DEFAULT;
+    aria_stream *s = aria_stream_open(ctx, &base, &cfg);
+    const float *a; aria_stream_stats st;
+    logline(NULL, "probing capacity (two %.1f s chunks)...", cfg.chunk_s);
+    if (!s || aria_stream_next(s, NULL, NULL, &a, &st) || aria_stream_next(s, NULL, NULL, &a, &st)) {
+        logline(NULL, "probe failed: %s (defaults: chunk %.1f s, %d session)", aria_last_error(), g_chunk, g_max_sessions);
+        aria_stream_close(s);
+        return;
+    }
+    aria_stream_close(s);
+    double r = st.gen_s / st.win_s;   /* compute seconds per second of window */
+    static const float ladder[] = { 2.0f, 3.0f, 4.0f, 6.0f };
+    for (int i = 0; i < 4; i++) {
+        float c = ladder[i];
+        g_chunk = c;
+        g_probe_rtf = c / (r * (cfg.context_s + ARIA_STREAM_SKIP_S + c + ARIA_STREAM_TAIL_S));
+        if (g_probe_rtf >= 1.25) break;
+    }
+    if (!sessions_set) g_max_sessions = g_probe_rtf >= 2.5 ? (int)(g_probe_rtf / 1.25) : 1;
+    if (g_probe_rtf >= 1.25)
+        logline(NULL, "probe: %.1f s window in %.2f s -> chunk %.0f s at %.2fx real time, %d live session%s",
+                st.win_s, st.gen_s, g_chunk, g_probe_rtf, g_max_sessions, g_max_sessions == 1 ? "" : "s");
+    else
+        logline(NULL, "probe: %.1f s window in %.2f s -> not real time on this device: best %.2fx at chunk %.0f s "
+                "(clients will buffer; a GPU server streams in real time)", st.win_s, st.gen_s, g_probe_rtf, g_chunk);
+}
 
 /* POST /stream: open a live session, then write its frames until it ends */
 static void handle_stream(aria_sock fd, const char *id, const char *body) {
@@ -667,7 +704,7 @@ static void handle_stream(aria_sock fd, const char *id, const char *body) {
     if (aria_json_get_string(body, "prompt", L->prompt, sizeof L->prompt) != 0) {
         free(L); respond_err(fd, id, 400, "Bad Request", "missing 'prompt'"); return;
     }
-    float chunk = aria_json_get_number(body, "chunk", &v) == 0 ? (float)v : 2.0f;
+    float chunk = aria_json_get_number(body, "chunk", &v) == 0 ? (float)v : g_chunk;
     float context = aria_json_get_number(body, "context", &v) == 0 ? (float)v : 6.0f;
     float ahead = aria_json_get_number(body, "ahead", &v) == 0 ? (float)v : chunk;
     if (!(chunk >= 0.5f && chunk <= 30.0f) || !(context >= 1.0f && context <= 30.0f) || !(ahead >= 0.0f && ahead <= 60.0f)) {
@@ -815,9 +852,10 @@ static void *conn_main(void *arg) {
     } else if (!strncmp(req, "GET /info", 9)) {
         char info[256];
         snprintf(info, sizeof info,
-                 "{\"model_type\":\"%s\",\"sample_rate\":%d,\"channels\":%d,\"tensors\":%d}",
+                 "{\"model_type\":\"%s\",\"sample_rate\":%d,\"channels\":%d,\"tensors\":%d,"
+                 "\"chunk\":%.1f,\"rtf\":%.2f,\"max_sessions\":%d}",
                  aria_model_type(g_ctx), aria_sample_rate(g_ctx),
-                 aria_audio_channels(g_ctx), aria_num_tensors(g_ctx));
+                 aria_audio_channels(g_ctx), aria_num_tensors(g_ctx), g_chunk, g_probe_rtf, g_max_sessions);
         respond_json(fd, 200, "OK", info);
     } else if (!strncmp(req, "GET /steers", 11)) {
         static const char *sn[] = {"residual", "latent", "text"};
@@ -855,7 +893,8 @@ static void usage(FILE *f, const char *prog) {
             "  --log    append the activity log to <file> (default stderr)\n"
             "  --steer-dir <dir>  load named steering directions (*.atns + dirs_meta.json, the\n"
             "           Hugging Face matteospanio/aria layout, e.g. directions/small); repeatable\n"
-            "  --max-sessions <n>  concurrent live sessions (default 1)\n"
+            "  --max-sessions <n>  concurrent live sessions (default: from the capacity probe)\n"
+            "  --no-probe          skip the startup capacity probe (chunk 2 s, 1 session)\n"
             "  --queue <n>         queued /generate jobs before 503 (default 32)\n"
             "  --max-wait <s>      longest a /generate job yields to live sessions (default 10)\n", prog);
 }
@@ -863,7 +902,7 @@ static void usage(FILE *f, const char *prog) {
 #ifndef ARIA_SERVER_NO_MAIN   /* tests/test_server.c includes this file for its helpers */
 int main(int argc, char **argv) {
     const char *model_dir = NULL, *bind_ip = "127.0.0.1", *log_path = NULL;
-    const char *steer_dirs[8]; int n_steer_dirs = 0;
+    const char *steer_dirs[8]; int n_steer_dirs = 0, probe = 1, sessions_set = 0;
     int port = 8321;
     worker_cfg w = { NULL, ARIA_DEVICE_AUTO, 0, 10.0f };   /* steps 0 = the model's default */
     for (int i = 1; i < argc; i++) {
@@ -872,7 +911,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--bind") && i + 1 < argc) bind_ip = argv[++i];
         else if (!strcmp(argv[i], "--log") && i + 1 < argc) log_path = argv[++i];
         else if (!strcmp(argv[i], "--steer-dir") && i + 1 < argc && n_steer_dirs < 8) steer_dirs[n_steer_dirs++] = argv[++i];
-        else if (!strcmp(argv[i], "--max-sessions") && i + 1 < argc) g_max_sessions = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--max-sessions") && i + 1 < argc) { g_max_sessions = atoi(argv[++i]); sessions_set = 1; }
+        else if (!strcmp(argv[i], "--no-probe")) probe = 0;
         else if (!strcmp(argv[i], "--queue") && i + 1 < argc) g_max_queue = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-wait") && i + 1 < argc) g_max_wait = atof(argv[++i]);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(stdout, argv[0]); return 0; }
@@ -897,6 +937,7 @@ int main(int argc, char **argv) {
     g_wcfg = &w;
     logline(NULL, "model type=%s sr=%d ch=%d", aria_model_type(g_ctx), aria_sample_rate(g_ctx), aria_audio_channels(g_ctx));
     for (int i = 0; i < n_steer_dirs; i++) load_steer_dir(steer_dirs[i]);
+    if (probe) probe_capacity(g_ctx, &w, sessions_set);
 
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
