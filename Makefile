@@ -139,11 +139,13 @@ live: aria-server
 
 # ---- tests ----
 TESTS := test_ops test_wav test_config test_sampler test_arena test_quant test_rng test_lora test_taae test_gemm test_stream test_live
+# POSIX-only (sockets, dirent): run by `make test`, not by build.bat (it reads TESTS only)
+POSIX_TESTS := test_server
 test: $(LIB)
 	@set -e; \
-	for t in $(TESTS); do \
+	for t in $(TESTS) $(POSIX_TESTS); do \
 	  echo "==> build $$t"; \
-	  $(CC) $(CFLAGS) -I$(SRC) tests/$$t.c -L$(BUILD) -laria $(LDFLAGS) -o $(BUILD)/$$t; \
+	  $(CC) $(CFLAGS) -I$(SRC) tests/$$t.c -L$(BUILD) -laria $(LDFLAGS) -lpthread -o $(BUILD)/$$t; \
 	  echo "==> run $$t"; \
 	  $(BUILD)/$$t; \
 	done; \

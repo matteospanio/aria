@@ -15,11 +15,12 @@
  * API (JSON in, WAV out; flat keys -- aria_json is a key extractor):
  *   GET  /health            -> {"ok":true}
  *   GET  /info              -> model type / sample rate / channels
+ *   GET  /steers            -> the named steering directions loaded with --steer-dir
  *   POST /generate          -> audio/wav (float32)
- *     {"prompt":"...", "seconds":10, "steps":8, "seed":11,
- *      "steer_dir":"/path/sweet.atns", "steer_layer":16, "steer_scale":0.3,
+ *     {"prompt":"...", "seconds":10, "steps":8, "seed":11, "steer":"sweet:0.3,sour:0.1"}
+ *     named steering is optional; the older single-steer form still works:
+ *     {"steer_dir":"/path/sweet.atns", "steer_layer":16, "steer_scale":0.3,
  *      "steer_site":"residual", "steer_window":"0-7", "steer_op":"add"}
- *     steering is optional: present iff steer_dir is set (single steer/request).
  */
 
 #include "aria.h"
@@ -27,6 +28,7 @@
 #include "aria_net.h"
 #include "aria_parity.h"
 
+#include <dirent.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -79,7 +81,8 @@ typedef struct job {
     float seconds;
     int steps;
     long long seed;
-    aria_steer steer;               /* steer.dir != NULL iff steering requested */
+    aria_steer steer;               /* legacy single steer: steer.dir != NULL iff requested */
+    aria_steer named[32]; int n_named;   /* named steers (dirs borrowed from g_steers) */
     /* response (owned by the job until the connection thread takes it) */
     void *wav; size_t wav_len;
     char err[256];
@@ -133,8 +136,9 @@ static void *worker_main(void *arg) {
         p.steps = j->steps > 0 ? j->steps : w->default_steps;
         p.seed = j->seed;
         p.device = w->device;
-        aria_steer_set set = { &j->steer, 1 };
+        aria_steer_set set = { &j->steer, 1 }, nset = { j->named, j->n_named };
         if (j->steer.dir) p.steer = &set;
+        else if (j->n_named) p.steer = &nset;
 
         aria_audio *audio = NULL;
         struct timespec t0, t1;
@@ -150,8 +154,10 @@ static void *worker_main(void *arg) {
             if (aria_wav_to_mem(audio, 32, &j->wav, &j->wav_len) != 0)
                 snprintf(j->err, sizeof j->err, "wav encode failed");
             aria_audio_free(audio);
-            logline(j->id, "generate \"%s\" %.1fs steps=%d seed=%lld%s -> %.2fs", pe,
-                    p.seconds_total, p.steps, (long long)p.seed, j->steer.dir ? " steered" : "", dt);
+            char stp[16] = "default";
+            if (p.steps > 0) snprintf(stp, sizeof stp, "%d", p.steps);
+            logline(j->id, "generate \"%s\" %.1fs steps=%s seed=%lld%s -> %.2fs", pe,
+                    p.seconds_total, stp, (long long)p.seed, p.steer ? " steered" : "", dt);
         }
         pthread_mutex_lock(&j->mu);
         j->done = 1;
@@ -221,6 +227,112 @@ static char *read_request(aria_sock fd, char **body, size_t *nread) {
 
 static aria_ctx *g_ctx;   /* introspection only (worker owns generation) */
 
+/* ---------------- named steering directions (--steer-dir) -------------------------------
+ * Loaded once at startup into a fixed table that is read-only afterwards (no locks):
+ * clients steer by name ("sweet:0.3") and never send file paths. */
+
+#define MAX_STEERS 32
+typedef struct { char name[48]; aria_steer st; } named_steer;   /* st.scale unused (per request) */
+static named_steer g_steers[MAX_STEERS];
+static int g_nsteers;
+
+static int steer_cmp(const void *a, const void *b) {
+    return strcmp(((const named_steer *)a)->name, ((const named_steer *)b)->name);
+}
+
+/* every <name>.atns in `dir`; the site/layer come from dirs_meta.json (the Hugging Face
+ * matteospanio/aria layout): an entry with "layer" is a residual steer at that layer,
+ * otherwise a _latent / _text suffix selects the latent / text-conditioning site. */
+static void load_steer_dir(const char *dir) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/dirs_meta.json", dir);
+    char *meta = aria_read_file(path, NULL);
+    DIR *d = opendir(dir);
+    if (!d) { logline(NULL, "steer-dir %s: cannot open", dir); free(meta); return; }
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        size_t n = strlen(e->d_name);
+        if (n < 6 || n - 5 >= sizeof g_steers[0].name || strcmp(e->d_name + n - 5, ".atns")) continue;
+        char name[48]; memcpy(name, e->d_name, n - 5); name[n - 5] = 0;
+        if (strspn(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != n - 5) {
+            logline(NULL, "steer-dir %s: skip %s (name must be [A-Za-z0-9_-])", dir, e->d_name); continue;
+        }
+        int dup = 0;
+        for (int i = 0; i < g_nsteers; i++) dup |= !strcmp(g_steers[i].name, name);
+        if (dup || g_nsteers == MAX_STEERS) {
+            logline(NULL, "steer-dir %s: skip %s (%s)", dir, name, dup ? "duplicate name" : "table full"); continue;
+        }
+        const char *o, *oe; double layer = -1;
+        int has_meta = meta && aria_json_object(meta, NULL, name, &o, &oe) == 0;
+        if (has_meta) aria_json_get_number_in(o, oe, "layer", &layer);
+        aria_steer_site site;
+        if (layer >= 0) site = ARIA_STEER_RESIDUAL;
+        else if (n - 5 > 7 && !strcmp(name + n - 5 - 7, "_latent")) site = ARIA_STEER_LATENT;
+        else if (n - 5 > 5 && !strcmp(name + n - 5 - 5, "_text")) site = ARIA_STEER_COND;
+        else { logline(NULL, "steer-dir %s: skip %s (no layer in dirs_meta.json, no _latent/_text suffix)", dir, name); continue; }
+        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        aria_parity_tensor t;
+        if (aria_parity_load(path, &t) != 0) { logline(NULL, "steer-dir %s: cannot load %s", dir, e->d_name); continue; }
+        float *v = malloc((size_t)t.numel * sizeof(float));
+        if (!v) { aria_parity_free(&t); continue; }
+        memcpy(v, t.data, (size_t)t.numel * sizeof(float));
+        double n2 = 0;
+        for (int64_t c = 0; c < t.numel; c++) n2 += (double)v[c] * v[c];
+        named_steer *ns = &g_steers[g_nsteers++];
+        snprintf(ns->name, sizeof ns->name, "%s", name);
+        ns->st.site = site; ns->st.op = ARIA_STEER_ADD; ns->st.layer = layer >= 0 ? (int)layer : 0;
+        ns->st.dir = v; ns->st.dim = (int)t.numel; ns->st.dir_norm2 = (float)n2;
+        ns->st.scale = 0.0f; ns->st.step_lo = 0; ns->st.step_hi = 1 << 30;
+        aria_parity_free(&t);
+        static const char *sn[] = {"residual", "latent", "text"};
+        char at[16] = "";
+        if (site == ARIA_STEER_RESIDUAL) snprintf(at, sizeof at, " L%d", (int)layer);
+        logline(NULL, "steer %s: %s%s dim=%d (%s)", name, sn[site], at, ns->st.dim, dir);
+    }
+    closedir(d);
+    free(meta);
+    qsort(g_steers, (size_t)g_nsteers, sizeof g_steers[0], steer_cmp);
+}
+
+static int steer_find(const char *name, size_t len) {
+    for (int i = 0; i < g_nsteers; i++)
+        if (strlen(g_steers[i].name) == len && !strncmp(g_steers[i].name, name, len)) return i;
+    return -1;
+}
+
+/* "name:scale[,name:scale...]" or "off" -> per-direction scales (merged into `scale`
+ * when `merge`, else replacing it). Every name is checked before anything changes, so a
+ * bad entry leaves `scale` untouched. Scale 0 removes a direction. */
+static int parse_steer_spec(const char *spec, float *scale, int merge, char *err, size_t errlen) {
+    float next[MAX_STEERS];
+    int off = !strcmp(spec, "off");
+    for (int i = 0; i < MAX_STEERS; i++) next[i] = merge && !off ? scale[i] : 0.0f;
+    if (!off) {
+        for (const char *p = spec; *p; ) {
+            while (*p == ' ' || *p == ',') p++;
+            if (!*p) break;
+            size_t nl = strcspn(p, ":,");
+            int k = steer_find(p, nl);
+            if (k < 0) { snprintf(err, errlen, "unknown steer '%.*s' (GET /steers lists them)", (int)(nl < 40 ? nl : 40), p); return -1; }
+            if (p[nl] != ':') { snprintf(err, errlen, "steer '%.47s' needs a scale (name:scale)", g_steers[k].name); return -1; }
+            char *end; double v = strtod(p + nl + 1, &end);
+            if (end == p + nl + 1) { snprintf(err, errlen, "bad scale for steer '%.47s'", g_steers[k].name); return -1; }
+            next[k] = (float)v;
+            p = end;
+        }
+    }
+    memcpy(scale, next, sizeof next);
+    return 0;
+}
+
+/* the steer items for `scale` (nonzero entries only) -> out[], returns the count */
+static int steer_items(const float *scale, aria_steer *out) {
+    int n = 0;
+    for (int i = 0; i < g_nsteers; i++)
+        if (scale[i] != 0.0f) { out[n] = g_steers[i].st; out[n].scale = scale[i]; n++; }
+    return n;
+}
+
 static int parse_steer_json(const char *body, aria_steer *st, char *err, size_t errlen) {
     char path[1024];
     if (aria_json_get_string(body, "steer_dir", path, sizeof path) != 0) return 0; /* no steer */
@@ -282,8 +394,17 @@ static void handle_generate(aria_sock fd, const char *id, const char *body) {
     j->seconds = aria_json_get_number(body, "seconds", &v) == 0 ? (float)v : 0.0f;
     j->steps = aria_json_get_number(body, "steps", &v) == 0 ? (int)v : 0;
     j->seed = aria_json_get_number(body, "seed", &v) == 0 ? (long long)v : -1;
-    char err[256] = "";
-    if (parse_steer_json(body, &j->steer, err, sizeof err) < 0) {
+    char err[256] = "", spec[512];
+    if (aria_json_get_string(body, "steer", spec, sizeof spec) == 0) {
+        float sc[MAX_STEERS] = {0};
+        if (parse_steer_spec(spec, sc, 0, err, sizeof err) < 0) {
+            respond_err(fd, id, 400, "Bad Request", err);
+            pthread_mutex_destroy(&j->mu); pthread_cond_destroy(&j->cv);
+            free(j->prompt); free(j);
+            return;
+        }
+        j->n_named = steer_items(sc, j->named);
+    } else if (parse_steer_json(body, &j->steer, err, sizeof err) < 0) {
         respond_err(fd, id, 400, "Bad Request", err);
         pthread_mutex_destroy(&j->mu); pthread_cond_destroy(&j->cv);
         free(j->prompt); free(j);
@@ -323,12 +444,20 @@ static void *conn_main(void *arg) {
                  aria_model_type(g_ctx), aria_sample_rate(g_ctx),
                  aria_audio_channels(g_ctx), aria_num_tensors(g_ctx));
         respond_json(fd, 200, "OK", info);
+    } else if (!strncmp(req, "GET /steers", 11)) {
+        static const char *sn[] = {"residual", "latent", "text"};
+        char out[4096]; size_t n = (size_t)snprintf(out, sizeof out, "{\"steers\":[");
+        for (int i = 0; i < g_nsteers && n < sizeof out - 128; i++)
+            n += (size_t)snprintf(out + n, sizeof out - n, "%s{\"name\":\"%s\",\"site\":\"%s\",\"layer\":%d,\"dim\":%d}",
+                                  i ? "," : "", g_steers[i].name, sn[g_steers[i].st.site], g_steers[i].st.layer, g_steers[i].st.dim);
+        snprintf(out + n, sizeof out - n, "]}");
+        respond_json(fd, 200, "OK", out);
     } else if (!strncmp(req, "POST /generate", 14)) {
         handle_generate(fd, id, body);
     } else {
         char line[64]; size_t k = strcspn(req, "\r\n"); if (k > 48) k = 48;
         memcpy(line, req, k); line[k] = 0;
-        char msg[128]; snprintf(msg, sizeof msg, "no route for '%s' (GET /health, GET /info, POST /generate)", line);
+        char msg[192]; snprintf(msg, sizeof msg, "no route for '%s' (GET /health, GET /info, GET /steers, POST /generate)", line);
         respond_err(fd, id, 404, "Not Found", msg);
     }
     free(req);
@@ -341,14 +470,18 @@ static void *conn_main(void *arg) {
 static void usage(FILE *f, const char *prog) {
     fprintf(f,
             "aria-server - resident HTTP server for the aria runtime\n\n"
-            "Usage: %s -m <model_dir> [--port 8321] [--bind 127.0.0.1] [--log <file>]\n"
+            "Usage: %s -m <model_dir> [--port 8321] [--bind 127.0.0.1] [--log <file>] [--steer-dir <dir>]...\n"
             "          [--device cpu|cuda|auto] [-s <steps (default: the model's, 6)>] [-d <default_seconds=10>]\n\n"
             "  --bind   address to listen on (default 127.0.0.1; 0.0.0.0 = every interface, no auth)\n"
-            "  --log    append the activity log to <file> (default stderr)\n", prog);
+            "  --log    append the activity log to <file> (default stderr)\n"
+            "  --steer-dir <dir>  load named steering directions (*.atns + dirs_meta.json, the\n"
+            "           Hugging Face matteospanio/aria layout, e.g. directions/small); repeatable\n", prog);
 }
 
+#ifndef ARIA_SERVER_NO_MAIN   /* tests/test_server.c includes this file for its helpers */
 int main(int argc, char **argv) {
     const char *model_dir = NULL, *bind_ip = "127.0.0.1", *log_path = NULL;
+    const char *steer_dirs[8]; int n_steer_dirs = 0;
     int port = 8321;
     worker_cfg w = { NULL, ARIA_DEVICE_AUTO, 0, 10.0f };   /* steps 0 = the model's default */
     for (int i = 1; i < argc; i++) {
@@ -356,6 +489,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bind") && i + 1 < argc) bind_ip = argv[++i];
         else if (!strcmp(argv[i], "--log") && i + 1 < argc) log_path = argv[++i];
+        else if (!strcmp(argv[i], "--steer-dir") && i + 1 < argc && n_steer_dirs < 8) steer_dirs[n_steer_dirs++] = argv[++i];
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(stdout, argv[0]); return 0; }
         else if (!strcmp(argv[i], "-s") && i + 1 < argc) w.default_steps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-d") && i + 1 < argc) w.default_seconds = (float)atof(argv[++i]);
@@ -376,6 +510,7 @@ int main(int argc, char **argv) {
     if (!g_ctx) { logline(NULL, "load error: %s", aria_last_error()); return 1; }
     w.ctx = g_ctx;
     logline(NULL, "model type=%s sr=%d ch=%d", aria_model_type(g_ctx), aria_sample_rate(g_ctx), aria_audio_channels(g_ctx));
+    for (int i = 0; i < n_steer_dirs; i++) load_steer_dir(steer_dirs[i]);
 
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
@@ -403,3 +538,4 @@ int main(int argc, char **argv) {
     logline(NULL, "bye");
     return 0;
 }
+#endif
