@@ -553,6 +553,7 @@ static __half *upload_f16(const float *h, size_t n) {
         uint16_t *tmp = (uint16_t *)malloc(n * sizeof(uint16_t));
         if (!tmp) { cudaFree(d); return NULL; }
         aria_f32_to_f16_n(tmp, h, n);
+        safetensors_release(h, n * sizeof(float));
         cudaMemcpy(d, tmp, n * sizeof(__half), cudaMemcpyHostToDevice);
         free(tmp);
         return d;
@@ -563,6 +564,7 @@ static __half *upload_f16(const float *h, size_t n) {
         int b = (int)(i & 1);
         cudaEventSynchronize(ev[b]);   /* the copy out of this buffer two chunks ago is done */
         aria_f32_to_f16_n(stage[b], h + off, c);
+        safetensors_release(h + off, c * sizeof(float));   /* source read: drop its mmap pages */
         cudaMemcpyAsync(d + off, stage[b], c * sizeof(__half), cudaMemcpyHostToDevice, st);
         cudaEventRecord(ev[b], st);
     }
@@ -570,7 +572,8 @@ static __half *upload_f16(const float *h, size_t n) {
 }
 static float *upload_f32(const float *h, size_t n) {
     float *d = NULL; if (cudaMalloc(&d, n * sizeof(float)) != cudaSuccess) return NULL;
-    cudaMemcpy(d, h, n * sizeof(float), cudaMemcpyHostToDevice); return d;
+    cudaMemcpy(d, h, n * sizeof(float), cudaMemcpyHostToDevice);
+    safetensors_release(h, n * sizeof(float)); return d;
 }
 
 /* y[M,N] = x[M,K] @ W[N,K]^T + b ; W is fp16 (converted on load), x/y/b fp32. */
@@ -840,6 +843,7 @@ static int upload_dqw(dqw *w, const float *W, int N, int K, aria_dtype dt) {
         void *hq = malloc(qb); float *hs = (float *)malloc(ns * sizeof(float));
         if (dt == ARIA_Q8) aria_q8_quant((int8_t *)hq, hs, W, N, K);
         else               aria_q4_quant((uint8_t *)hq, hs, W, N, K);
+        safetensors_release(W, (size_t)N * K * sizeof(float));
         CK(cudaMalloc(&w->q, qb)); CK(cudaMemcpy(w->q, hq, qb, cudaMemcpyHostToDevice));
         CK(cudaMalloc(&w->scale, ns * sizeof(float)));
         CK(cudaMemcpy(w->scale, hs, ns * sizeof(float), cudaMemcpyHostToDevice));

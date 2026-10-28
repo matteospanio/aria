@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GPU VRAM −30 to −47 % (medium 60 s 4.3 → 2.3 GB), CPU RSS −0.2 to −1 GB; output and speed
   unchanged. `--batch`, `--stream`, `--bench N` and `aria-server` keep everything resident.
   Library callers opt in with `aria_gen_params.oneshot = 1`.
+- On the GPU, each weight's host pages are dropped as soon as it is uploaded, instead of the whole
+  file after the first decode: peak host RAM small 2.3 GB → 0.5 GB, medium 7.4 GB → 0.56 GB, in
+  one-shot and resident runs alike; output and warm speed unchanged.
 
 ### Added
 

@@ -105,6 +105,8 @@ quality check against the exact path (see [BENCHMARKS.md](BENCHMARKS.md)):
 A single run frees the text encoder and the DiT as soon as each is done, so its peak memory
 is the largest stage rather than the sum (medium 60 s on the GPU: 2.3 GB of VRAM instead of
 4.3 GB). `--batch`, `--stream`, `--bench N` and `aria-server` keep the model resident for speed.
+On the GPU, host RAM stays around 0.5 GB for either model: each weight leaves host memory as
+soon as it is uploaded.
 
 `-m <dir>` is any directory with `model_config.json` and `model.safetensors` (what `download_model.sh` produces, or a raw Hugging Face snapshot). Text prompts need the T5Gemma weights plus the exported tokenizer; `--uncond` and `--prompt-embed` work without them.
 

@@ -17,6 +17,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* SA3 small-music has 685 tensors; medium is larger. Keep generous. */
 #define SAFETENSORS_MAX_TENSORS 4096
 
@@ -61,6 +65,11 @@ void safetensors_close(safetensors_file_t *sf);
  * the host again -- frees the host RSS; any re-access just re-faults from the file. */
 void safetensors_advise_dontneed(const safetensors_file_t *sf);
 
+/* Same, for one range: drops the whole pages inside [p, p+bytes) when the range lies in
+ * an open safetensors mapping; a no-op for any other memory (heap buffers stay intact).
+ * Called right after a weight is uploaded, so host RSS never holds the whole model. */
+void safetensors_release(const void *p, size_t bytes);
+
 /* Find a tensor by exact name, returns NULL if not found. */
 const safetensor_t *safetensors_find(const safetensors_file_t *sf, const char *name);
 
@@ -82,5 +91,9 @@ void safetensors_print_all(const safetensors_file_t *sf);
 
 /* Convenience: number of tensors whose name starts with prefix. */
 int safetensors_count_prefix(const safetensors_file_t *sf, const char *prefix);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* ARIA_SAFETENSORS_H */

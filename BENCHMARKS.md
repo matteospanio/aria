@@ -110,6 +110,19 @@ VRAM (`nvidia-smi` minus 332 MB idle) and peak RSS, default settings:
 | CPU small 60 s, q8 | | 1000 → **708 MB** |
 | CPU medium 10 s, q4 | | 3634 → **2661 MB** (−27 %) |
 
+### Host RAM on the GPU path
+
+The host weights are mmap'd F32. The GPU upload now drops each tensor's pages right after reading
+it (`safetensors_release`, a no-op outside the mapping), so host RSS never holds the whole model.
+`cmp`-identical (GPU auto/fp32, both models, 10/60 s ± prompt, `--bench`, `--stream`); warm-min
+unchanged; the upload (`weights=`) pays the page teardown, +0.02–0.06 s.
+
+| GPU run | peak RSS before → after |
+|---|---|
+| small 10 / 60 s (one-shot or resident) | 2314 / 2324 → **508 / 517 MB** |
+| small 10 s, text prompt | 2316 → **510 MB** |
+| medium 10 / 60 s | 7375 / 7384 → **564 / 573 MB** |
+
 aria (this runtime) vs **stable-audio-tools** (the PyTorch reference), same machine,
 same model weights, same workload: **uncond, 8-step pingpong, DiT + autoencoder
 decode** (no text encoder — isolates the core diffusion runtime). Both measure

@@ -10,6 +10,11 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <stdint.h>
+
+/* open mappings, so safetensors_release() can tell mmap'd weights from heap memory */
+#define SF_MAX_MAPS 8   /* ponytail: fixed table; a model opens 2-3 files */
+static const safetensors_file_t *g_maps[SF_MAX_MAPS];
 
 /* ---- minimal JSON scanning for the safetensors header ---- */
 
@@ -227,6 +232,8 @@ safetensors_file_t *safetensors_open(const char *path) {
             return NULL;
         }
     }
+    for (int i = 0; i < SF_MAX_MAPS; i++)
+        if (!g_maps[i]) { g_maps[i] = sf; break; }
     return sf;
 }
 
@@ -234,8 +241,22 @@ void safetensors_advise_dontneed(const safetensors_file_t *sf) {
     if (sf && sf->data) madvise(sf->data, sf->file_size, MADV_DONTNEED);
 }
 
+void safetensors_release(const void *p, size_t bytes) {
+    const char *a = p;
+    for (int i = 0; i < SF_MAX_MAPS; i++) {
+        const safetensors_file_t *sf = g_maps[i];
+        if (!sf || a < (const char *)sf->data || a + bytes > (const char *)sf->data + sf->file_size) continue;
+        uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
+        uintptr_t lo = ((uintptr_t)a + pg - 1) & ~(pg - 1), hi = ((uintptr_t)a + bytes) & ~(pg - 1);
+        if (hi > lo) madvise((void *)lo, hi - lo, MADV_DONTNEED);   /* interior pages only */
+        return;
+    }
+}
+
 void safetensors_close(safetensors_file_t *sf) {
     if (!sf) return;
+    for (int i = 0; i < SF_MAX_MAPS; i++)
+        if (g_maps[i] == sf) g_maps[i] = NULL;
     if (sf->data) munmap(sf->data, sf->file_size);
     free(sf->path);
     free(sf->header_json);
