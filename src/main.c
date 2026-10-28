@@ -13,13 +13,14 @@
 #include "aria.h"
 #include "aria_wav.h"
 #include "aria_hpss.h"
+#include "aria_stream.h"
 #include "aria_parity.h"   /* .atns reader for --steer direction loading (E12.7) */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <math.h>        /* sqrt for the phase-aligned crossfade */
+#include <math.h>        /* sqrt (hpss stats) */
 #ifdef _WIN32
 #include "aria_pthread_compat.h"
 #else
@@ -427,68 +428,6 @@ static int stream_poll_prompt(char *buf, size_t cap) {
     return 0;
 }
 
-/* interleaved frames [start, start+len) of `a` -> new aria_audio */
-static aria_audio *stream_slice(const aria_audio *a, int64_t start, int64_t len) {
-    if (start < 0) start = 0;
-    if (start + len > a->num_frames) len = a->num_frames - start;
-    if (len < 0) len = 0;
-    aria_audio *o = aria_audio_alloc(a->sample_rate, a->channels, len);
-    if (o && len) memcpy(o->data, a->data + start * a->channels, (size_t)len * a->channels * sizeof(float));
-    return o;
-}
-
-/* Append `src` onto `outp`, phase-aligning it to the existing tail before crossfading.
- * The continuation is only beat-plausible, not sample-accurate, so a plain crossfade
- * "flams" misaligned drum hits; here we cross-correlate `src`'s start against the output's
- * last ~60 ms over a 0..`maxlag` search, shift `src` by the best lag, then linearly
- * crossfade `xf` frames. maxlag=0 -> plain crossfade (used for the first segment). */
-static void stream_append_aligned(aria_audio *outp, int64_t *written, int64_t cap,
-                                  const aria_audio *src, int64_t xf, int64_t maxlag) {
-    int ch = outp->channels; int64_t n = src->num_frames, lag = 0;
-    const int64_t clen = 1764, cstride = 2;   /* ~40 ms window, every 2nd sample */
-    int64_t W = *written;
-    if (W >= clen && maxlag > 0 && n >= clen + maxlag) {
-        const float *ref = outp->data + (W - clen) * ch;   /* mono via channel sum */
-        double best = -1e30;
-        for (int64_t L = 0; L <= maxlag; L++) {
-            const float *cand = src->data + L * ch;
-            double dot = 0, ea = 0, eb = 0;
-            for (int64_t i = 0; i < clen; i += cstride) {
-                float a = ref[i * ch] + (ch > 1 ? ref[i * ch + 1] : 0.0f);
-                float b = cand[i * ch] + (ch > 1 ? cand[i * ch + 1] : 0.0f);
-                dot += (double)a * b; ea += (double)a * a; eb += (double)b * b;
-            }
-            double corr = dot / (sqrt(ea * eb) + 1e-9);
-            if (corr > best) { best = corr; lag = L; }
-        }
-    }
-    int64_t xfe = xf;
-    if (xfe > *written) xfe = *written;
-    if (lag + xfe > n) xfe = n - lag;
-    if (xfe < 0) xfe = 0;
-    for (int64_t i = 0; i < xfe; i++) {
-        float w = (float)(i + 1) / (float)(xfe + 1);
-        int64_t o = (*written - xfe + i) * ch;
-        for (int c = 0; c < ch; c++)
-            outp->data[o + c] = (1.0f - w) * outp->data[o + c] + w * src->data[(lag + i) * ch + c];
-    }
-    int64_t rest = n - lag - xfe;
-    if (*written + rest > cap) rest = cap - *written;
-    if (rest > 0) memcpy(outp->data + (*written) * ch, src->data + (lag + xfe) * ch, (size_t)rest * ch * sizeof(float));
-    *written += rest;
-}
-
-/* add the looped percussive `held` (held_len frames) into `dst`[n] starting at output
- * position `pos` (modulo tiling) — the held drum groove, steady across chunks. */
-static void stream_add_tiled(float *dst, int64_t n, int ch, int64_t pos,
-                             const float *held, int64_t held_len) {
-    if (held_len <= 0) return;
-    for (int64_t j = 0; j < n; j++) {
-        int64_t k = (pos + j) % held_len;
-        for (int c = 0; c < ch; c++) dst[j * ch + c] += held[k * ch + c];
-    }
-}
-
 /* Bounded FIFO of settled audio chunks. The generator (main thread) pushes; a writer
  * thread drains to stdout. This decouples generation from the blocking pipe write so the
  * next chunk is generated WHILE the player drains the current one, instead of alternating
@@ -526,213 +465,109 @@ static void *sq_writer(void *arg) {   /* drains the queue to stdout at the playe
     return NULL;
 }
 
-/* settle the frames [*emitted, upto) of `outp` (the harmonic timeline) as raw interleaved
- * float32, mixing in the held drum loop, and hand them to the writer thread. Lets
- * `aria --stream -o - | play -t raw -r <sr> -e float -b 32 -c <ch> -` play live. */
-static void stream_flush(const aria_audio *outp, const float *held, int64_t held_len,
-                         int ch, int64_t *emitted, int64_t upto, squeue *q) {
-    if (upto <= *emitted) return;
-    int64_t n = upto - *emitted;
-    float *tmp = malloc((size_t)n * ch * sizeof(float));
-    memcpy(tmp, outp->data + (*emitted) * ch, (size_t)n * ch * sizeof(float));
-    stream_add_tiled(tmp, n, ch, *emitted, held, held_len);   /* no-op if held_len==0 */
-    sq_push(q, tmp, n * ch);   /* the writer thread frees tmp after writing it out */
-    *emitted = upto;
-}
-
-/* Streaming / interactive generation: keep the model resident and emit `emit_s`-second
- * segments by sliding-window continuation over a `context_s` rolling context. The naive
- * tail-inpaint fades (SA3 makes the regenerated end an outro), so each continuation
- * regenerates context + skip + emit + tail and emits only the STRONG BODY — skipping the
- * ~1.5 s post-context seam and discarding the ~3 s fade-out (profile measured on a long
- * continuation) — crossfaded onto the output. Each step re-reads the prompt (live
- * re-steering on a TTY). `emit_s` is the --chunk value. */
+/* Streaming / interactive generation: the model stays resident and aria_stream emits
+ * `emit_s`-second segments by sliding-window continuation over a `context_s` rolling
+ * context (see aria_stream.h). This driver adds the CLI parts: live re-prompting from
+ * stdin, the --steer-ramp, logging, and the output (a writer thread feeding stdout for
+ * `-o -`, or one WAV at the end). */
 static int cmd_stream(aria_ctx *ctx, aria_gen_params *p, float emit_s, float context_s,
                       int n_chunks, int hold, const char *out_path,
                       aria_steer *ramp_target, float ramp_lo, float ramp_hi, int ramp_tri,
                       float anchor_beta, int evolve_n) {
     int sr = aria_sample_rate(ctx), ch = aria_audio_channels(ctx);
-    const float skip_s = 1.5f, tail_s = 3.0f, xfade_s = 0.25f;   /* seam / fade / crossfade */
-    int64_t ctx_fr = (int64_t)(context_s * sr), xf_fr = (int64_t)(xfade_s * sr);
-    int64_t maxlag = (int64_t)(0.18f * sr);   /* phase-align search range (~< one beat) */
 #ifdef _WIN32
     int interactive = 0;                    /* stream_poll_prompt is a no-op on Windows */
 #else
     int interactive = isatty(fileno(stdin));
 #endif
     char promptbuf[1024];
-    float *held = NULL; int64_t held_len = 0; const char *held_prompt = NULL;  /* --hold drum loop */
-    /* E14b re-anchoring: keep the chunk-0 context tail as an energy/character reference and
-     * blend every later context toward it -- chained continuations can no longer inherit an
-     * outro fade and decay to silence (the documented streaming ceiling). Conditioning-only:
-     * the blend never reaches the output (only the regenerated body is emitted). */
-    if (anchor_beta < 0.0f) anchor_beta = 0.0f;
-    if (anchor_beta > 1.0f) anchor_beta = 1.0f;
-    aria_audio *anchor = NULL;
-    /* E14c seed policy (SA3-Realtime semantics): default = FIXED seed every chunk, so the
-     * per-chunk noise is identical and the voice carries forward ("continue"); --evolve N
-     * re-seeds every N chunks for fresh variation. */
-    int64_t base_seed = p->seed; int evolve_k = 0;
+    aria_stream_cfg sc = ARIA_STREAM_CFG_DEFAULT;
+    sc.chunk_s = emit_s; sc.context_s = context_s; sc.anchor = anchor_beta;
+    sc.evolve = evolve_n; sc.hold = hold;
+    aria_stream *st = aria_stream_open(ctx, p, &sc);
+    if (!st) { fprintf(stderr, "stream: %s\n", aria_last_error()); return 1; }
     int to_stdout = (strcmp(out_path, "-") == 0);   /* -o - : stream raw f32 to stdout for a player */
 #ifdef _WIN32
     if (to_stdout) _setmode(_fileno(stdout), _O_BINARY);   /* text mode would turn every 0x0A into CRLF */
 #endif
-    int64_t emitted = 0;
     squeue q = { .m = PTHREAD_MUTEX_INITIALIZER, .ne = PTHREAD_COND_INITIALIZER, .nf = PTHREAD_COND_INITIALIZER };
     pthread_t writer; int have_writer = 0;
     if (to_stdout) { pthread_create(&writer, NULL, sq_writer, &q); have_writer = 1; }
-
-    int64_t cap = (int64_t)((context_s + emit_s) * sr) + (int64_t)n_chunks * ((int64_t)(emit_s * sr) + maxlag) + sr;
-    aria_audio *outp = aria_audio_alloc(sr, ch, cap);
-    if (!outp) { fprintf(stderr, "stream: OOM\n"); return 1; }
-    int64_t written = 0;
-    aria_audio *context = NULL;
+    float *all = NULL; int64_t nall = 0, capall = 0;   /* file mode: the whole stream */
 
     const char *devname = p->device == ARIA_DEVICE_CPU ? "CPU" : p->device == ARIA_DEVICE_CUDA ? "CUDA" : "auto";
     char stepbuf[16];
     if (p->steps > 0) snprintf(stepbuf, sizeof stepbuf, "%d", p->steps); else snprintf(stepbuf, sizeof stepbuf, "default");
     fprintf(stderr, "[stream] emit=%.1fs context=%.1fs (skip %.1f / tail %.1f / xfade %.2f) steps=%s (%s)%s%s%s\n",
-            emit_s, context_s, skip_s, tail_s, xfade_s, stepbuf, devname,
+            emit_s, context_s, ARIA_STREAM_SKIP_S, ARIA_STREAM_TAIL_S, ARIA_STREAM_XFADE_S, stepbuf, devname,
             anchor_beta > 0.0f ? " +anchor" : "", evolve_n > 0 ? " +evolve" : "",
             interactive ? " — type a prompt + Enter to re-steer" : "");
 
-    for (int i = 0; i < n_chunks; i++) {
-        /* poll stdin (TTY or pipe) for a new prompt -> live re-steering between chunks */
-        if (stream_poll_prompt(promptbuf, sizeof promptbuf)) {
-            p->prompt = promptbuf;
-            fprintf(stderr, "[stream] prompt -> \"%s\"\n", promptbuf);
-        }
-        /* E14c: evolve -- fresh variation every N chunks (base seed stays the anchor of
-         * the sequence so runs are reproducible); default (evolve_n==0) never re-seeds. */
-        if (evolve_n > 0 && i > 0 && i % evolve_n == 0) {
-            p->seed = (base_seed >= 0 ? base_seed : 0) + (++evolve_k);
-            fprintf(stderr, "[stream] evolve: seed -> %lld\n", (long long)p->seed);
-        }
-        /* i==0: plain text->audio, emit the strong front [0, context+emit] (drop its fade).
-         * i>0 : continuation; emit the body [context+skip, context+skip+emit]. */
-        float win_s = (i == 0) ? (context_s + emit_s + tail_s)
-                               : (context_s + skip_s + emit_s + tail_s);
-        int64_t emit_start = (i == 0) ? 0 : (int64_t)((context_s + skip_s) * sr);
-        int64_t emit_len   = (i == 0) ? (int64_t)((context_s + emit_s) * sr)
-                                      : (int64_t)(emit_s * sr);
-        p->seconds_total = win_s;
-        p->init_audio_mem = (i == 0) ? NULL : context;
-        p->inpaint_continue = (i == 0) ? 0 : 1;
-        /* B5 (E14.1): decode only the region we actually emit (+ the maxlag search room
-         * + a small halo margin), not the whole win_s window. CPU decoders only; the
-         * GPU decode is already fast + monolithic and ignores this. */
-        p->decode_from_s = (float)emit_start / sr - 0.25f;
-        p->decode_to_s   = (float)(emit_start + emit_len + maxlag) / sr + 0.25f;
-        if (p->decode_from_s < 0.0f) p->decode_from_s = 0.0f;
-        if (ramp_target && n_chunks > 1) {
-            /* E14: live steering ramp -- linear lo->hi over the chunks, or triangular
-             * (lo->hi->lo) with 'tri'. The steer set points at this item, so the new
-             * scale flows into the next generate (device path re-uploads per request). */
-            float t = (float)i / (float)(n_chunks - 1);
-            float u = ramp_tri ? (t <= 0.5f ? 2.0f * t : 2.0f * (1.0f - t)) : t;
-            ramp_target->scale = ramp_lo + (ramp_hi - ramp_lo) * u;
-            fprintf(stderr, "[stream] chunk %d steer scale %.3f\n", i + 1, ramp_target->scale);
-        }
-
-        aria_audio *win = NULL;
-        struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
-        int rc = aria_generate(ctx, p, &win);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        if (rc != 0 || !win) {
-            fprintf(stderr, "stream: generate failed: %s\n", aria_last_error());
-            if (have_writer) { pthread_mutex_lock(&q.m); q.done = 1; pthread_cond_signal(&q.ne); pthread_mutex_unlock(&q.m); pthread_join(writer, NULL); }
-            aria_audio_free(outp); aria_audio_free(context); return 1;
-        }
-        double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
-
-        /* extra `maxlag` frames so the phase-align search has room to shift into */
-        int64_t slice_len = emit_len + (i == 0 ? 0 : maxlag);
-        if (emit_start + slice_len > win->num_frames) slice_len = win->num_frames - emit_start;
-        aria_audio *emit = stream_slice(win, emit_start, slice_len);
-        if (hold) {
-            /* split the emit; `outp` accumulates only the HARMONIC, the drum groove is a
-             * held loop tiled later -> drums stay perfectly steady across chunks. */
-            int64_t en = emit->num_frames;
-            float *H = malloc((size_t)en * ch * sizeof(float)), *P = malloc((size_t)en * ch * sizeof(float));
-            aria_hpss_separate(emit->data, en, ch, H, P);
-            if (!held || p->prompt != held_prompt) {   /* establish/reset the loop on chunk 0 or prompt change */
-                free(held); held_len = en; held = malloc((size_t)held_len * ch * sizeof(float));
-                memcpy(held, P, (size_t)held_len * ch * sizeof(float));
-                held_prompt = p->prompt;
-                fprintf(stderr, "[stream] drum loop set (%.1fs)\n", held_len / (double)sr);
+    int rc = 0;
+    for (int i = 0; i <= n_chunks && rc == 0; i++) {
+        const float *audio; int64_t n;
+        if (i < n_chunks) {
+            /* poll stdin (TTY or pipe) for a new prompt -> live re-steering between chunks */
+            if (stream_poll_prompt(promptbuf, sizeof promptbuf)) {
+                p->prompt = promptbuf;
+                fprintf(stderr, "[stream] prompt -> \"%s\"\n", promptbuf);
             }
-            memcpy(emit->data, H, (size_t)en * ch * sizeof(float));   /* emit -> harmonic only */
-            free(H); free(P);
-        }
-        stream_append_aligned(outp, &written, cap, emit, (i == 0) ? 0 : xf_fr, (i == 0) ? 0 : maxlag);
-        aria_audio_free(emit);
-
-        double es = emit_len / (double)sr;
-        fprintf(stderr, "[stream] chunk %d/%d: emit %.1fs (win %.1fs) in %.2fs (RTF %.1fx)  \"%s\"\n",
-                i + 1, n_chunks, es, win_s, dt, dt > 0 ? es / dt : 0.0, p->prompt ? p->prompt : "");
-
-        aria_audio_free(context);
-        context = stream_slice(outp, written - ctx_fr, ctx_fr);   /* just-emitted tail */
-        if (anchor_beta > 0.0f) {
-            if (i == 0) {
-                /* chunk-0 tail = the reference the stream keeps being pulled back toward
-                 * (captured pre-hold-mix: the harmonic timeline; drums are re-added below) */
-                anchor = stream_slice(context, 0, context->num_frames);
-                fprintf(stderr, "[stream] anchor set (%.1fs, beta %.2f)\n",
-                        anchor ? anchor->num_frames / (double)sr : 0.0, anchor_beta);
-            } else if (anchor && anchor->num_frames > 0) {
-                /* convex blend toward the reference, then pull the context's ENERGY back to
-                 * the reference level (boost-only, capped at 4x): a linear blend alone cannot
-                 * out-weigh a tail that already faded 15+ dB, so the model would still hear
-                 * "quiet outro" and keep fading. Peak guard keeps the taae encoder in range. */
-                int64_t bn = context->num_frames < anchor->num_frames
-                           ? context->num_frames : anchor->num_frames;
-                double e_ctx = 0.0, e_anc = 0.0;
-                for (int64_t j = 0; j < bn * ch; j++) {
-                    float v = (1.0f - anchor_beta) * context->data[j] + anchor_beta * anchor->data[j];
-                    context->data[j] = v;
-                    e_ctx += (double)v * v;
-                    e_anc += (double)anchor->data[j] * anchor->data[j];
-                }
-                float g = 1.0f;
-                if (e_ctx > 0.0 && e_anc > e_ctx)
-                    g = (float)sqrt(e_anc / e_ctx);
-                if (g > 4.0f) g = 4.0f;
-                float pk = 0.0f;
-                for (int64_t j = 0; j < bn * ch; j++) {
-                    float v = context->data[j] * g;
-                    context->data[j] = v;
-                    float av = fabsf(v); if (av > pk) pk = av;
-                }
-                if (pk > 0.97f) {
-                    float sc = 0.97f / pk;
-                    for (int64_t j = 0; j < bn * ch; j++) context->data[j] *= sc;
-                }
+            if (ramp_target && n_chunks > 1) {
+                /* E14: live steering ramp -- linear lo->hi over the chunks, or triangular
+                 * (lo->hi->lo) with 'tri'. The steer set points at this item, so the new
+                 * scale flows into the next generate (device path re-uploads per request). */
+                float t = (float)i / (float)(n_chunks - 1);
+                float u = ramp_tri ? (t <= 0.5f ? 2.0f * t : 2.0f * (1.0f - t)) : t;
+                ramp_target->scale = ramp_lo + (ramp_hi - ramp_lo) * u;
+                fprintf(stderr, "[stream] chunk %d steer scale %.3f\n", i + 1, ramp_target->scale);
             }
+            aria_stream_stats ss;
+            if (aria_stream_next(st, p->prompt, p->steer, &audio, &ss) != 0) {
+                fprintf(stderr, "stream: generate failed: %s\n", aria_last_error());
+                rc = 1; break;
+            }
+            if (ss.reseeded) fprintf(stderr, "[stream] evolve: seed -> %lld\n", (long long)ss.seed);
+            if (ss.hold_set) fprintf(stderr, "[stream] drum loop set\n");
+            if (ss.anchor_set && anchor_beta > 0.0f)
+                fprintf(stderr, "[stream] anchor set (%.1fs, beta %.2f)\n", context_s, anchor_beta);
+            fprintf(stderr, "[stream] chunk %d/%d: emit %.1fs (win %.1fs) in %.2fs (RTF %.1fx)  \"%s\"\n",
+                    i + 1, n_chunks, ss.emit_s, ss.win_s, ss.gen_s, ss.gen_s > 0 ? ss.emit_s / ss.gen_s : 0.0,
+                    p->prompt ? p->prompt : "");
+            n = ss.frames;
+        } else {
+            n = aria_stream_flush(st, &audio);   /* the held-back crossfade tail */
         }
-        if (hold) stream_add_tiled(context->data, ctx_fr, ch, written - ctx_fr, held, held_len);
-        aria_audio_free(win);
-
-        /* live playback: hand settled audio to the writer thread, holding back the crossfade
-         * region (xf_fr) so the next chunk can still crossfade into it. The next chunk
-         * generates while the writer feeds the player. */
-        if (to_stdout) stream_flush(outp, held, held_len, ch, &emitted, written - xf_fr, &q);
+        if (n <= 0) continue;
+        if (to_stdout) {   /* the writer thread frees the copy after writing it out */
+            float *tmp = malloc((size_t)n * ch * sizeof(float));
+            if (!tmp) { rc = 1; break; }
+            memcpy(tmp, audio, (size_t)n * ch * sizeof(float));
+            sq_push(&q, tmp, n * ch);
+        } else {
+            if (nall + n > capall) {
+                int64_t nc = (nall + n) * 2;
+                float *g = realloc(all, (size_t)nc * ch * sizeof(float));
+                if (!g) { rc = 1; break; }
+                all = g; capall = nc;
+            }
+            memcpy(all + nall * ch, audio, (size_t)n * ch * sizeof(float));
+            nall += n;
+        }
     }
-    int wrc = 0;
-    if (to_stdout) {
-        stream_flush(outp, held, held_len, ch, &emitted, written, &q);   /* final tail */
+    if (have_writer) {
         pthread_mutex_lock(&q.m); q.done = 1; pthread_cond_signal(&q.ne); pthread_mutex_unlock(&q.m);
-        pthread_join(writer, NULL); have_writer = 0;
-        fprintf(stderr, "[stream] streamed %.1fs to stdout\n", written / (double)sr);
-    } else {
-        if (hold) stream_add_tiled(outp->data, written, ch, 0, held, held_len);   /* mix the steady drums in */
-        outp->num_frames = written;
-        wrc = aria_wav_write(out_path, outp, 32);
-        fprintf(stderr, "[stream] wrote %s (%.1fs total)\n", out_path, written / (double)sr);
+        pthread_join(writer, NULL);
     }
-    free(held);
-    aria_audio_free(outp); aria_audio_free(context); aria_audio_free(anchor);
-    return wrc;
+    aria_stream_close(st);
+    if (rc == 0 && to_stdout) {
+        fprintf(stderr, "[stream] streamed to stdout\n");
+    } else if (rc == 0) {
+        aria_audio outp = { sr, ch, nall, all };
+        rc = aria_wav_write(out_path, &outp, 32);
+        fprintf(stderr, "[stream] wrote %s (%.1fs total)\n", out_path, nall / (double)sr);
+    }
+    free(all);
+    return rc;
 }
 
 int main(int argc, char **argv) {

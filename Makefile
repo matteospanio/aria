@@ -38,6 +38,8 @@ LIB_SRCS := \
   $(SRC)/aria_t5enc.c \
   $(SRC)/aria_tokenizer.c \
   $(SRC)/aria_sampler.c \
+  $(SRC)/aria_stream.c \
+  $(SRC)/aria_hpss.c \
   $(SRC)/aria.c \
   $(SRC)/aria_model_sa3.c
 
@@ -125,15 +127,15 @@ $(BUILD)/%.o: $(SRC)/%.c | $(BUILD)
 $(LIB): $(LIB_OBJS)
 	$(AR) rcs $@ $^
 
-aria: $(BUILD)/main.o $(BUILD)/aria_hpss.o $(LIB)
-	$(CC) $(CFLAGS) -I$(SRC) $(BUILD)/main.o $(BUILD)/aria_hpss.o -L$(BUILD) -laria $(LDFLAGS) -o $@
+aria: $(BUILD)/main.o $(LIB)
+	$(CC) $(CFLAGS) -I$(SRC) $(BUILD)/main.o -L$(BUILD) -laria $(LDFLAGS) -o $@
 
 # resident HTTP server (ds4-server pattern): one worker thread owns the ctx
 aria-server: $(BUILD)/aria_server.o $(LIB)
 	$(CC) $(CFLAGS) -I$(SRC) $(BUILD)/aria_server.o -L$(BUILD) -laria $(LDFLAGS) -lpthread -o $@
 
 # ---- tests ----
-TESTS := test_ops test_wav test_config test_sampler test_arena test_quant test_rng test_lora test_taae test_gemm
+TESTS := test_ops test_wav test_config test_sampler test_arena test_quant test_rng test_lora test_taae test_gemm test_stream
 test: $(LIB)
 	@set -e; \
 	for t in $(TESTS); do \
