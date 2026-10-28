@@ -782,6 +782,7 @@ int main(int argc, char **argv) {
         p.rng_torch = cfg.rng_torch;
         p.schedule = cfg.schedule;
         p.headroom_s = cfg.headroom;
+        p.oneshot = cfg.bench == 1;   /* single run: free stages as they finish (lower peak) */
         aria_steer steer_items[16]; aria_steer_set steer_set = {0};   /* E12 activation steering */
         if (cfg.n_steer > 0) {
             if (build_steer_set(&cfg, steer_items, &steer_set) != 0) { aria_free(ctx); return 1; }

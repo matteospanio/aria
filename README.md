@@ -102,6 +102,10 @@ quality check against the exact path (see [BENCHMARKS.md](BENCHMARKS.md)):
 | q8 DiT with int8 activations (`q8a8`) | GPUs with int8 tensor cores (sm_75+) | `--precision fp32` (fp16 storage on the GPU) |
 | fp32 DiT | CPU (the int8 paths are slower on x86) | — |
 
+A single run frees the text encoder and the DiT as soon as each is done, so its peak memory
+is the largest stage rather than the sum (medium 60 s on the GPU: 2.3 GB of VRAM instead of
+4.3 GB). `--batch`, `--stream`, `--bench N` and `aria-server` keep the model resident for speed.
+
 `-m <dir>` is any directory with `model_config.json` and `model.safetensors` (what `download_model.sh` produces, or a raw Hugging Face snapshot). Text prompts need the T5Gemma weights plus the exported tokenizer; `--uncond` and `--prompt-embed` work without them.
 
 ## Steering

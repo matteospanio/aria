@@ -74,9 +74,13 @@ typedef struct {
     float headroom_s;               /* stable_audio_3 duration_padding_sec: generate this many
                                      * extra seconds of latent, cropped after decode (text->audio
                                      * only; 0 = off; the reference uses 6) */
+    int   oneshot;                  /* 1 = last request on this ctx: free each stage (text encoder,
+                                     * DiT) once it is done, so peak memory is the largest stage
+                                     * rather than their sum. Later requests still work (stages
+                                     * reload). 0 = keep everything resident (batch/stream/server) */
 } aria_gen_params;
 
-#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 0, 1.0f, 0, ARIA_DEVICE_AUTO, ARIA_DTYPE_AUTO, NULL, NULL, 0.0f, 0.0f, 0, NULL, NULL, 0, NULL, NULL, NULL, 0.0f, 0.0f, ARIA_SCHED_DEFAULT, 0.0f }
+#define ARIA_GEN_PARAMS_DEFAULT { NULL, NULL, 15.0f, 0, 1.0f, 0, ARIA_DEVICE_AUTO, ARIA_DTYPE_AUTO, NULL, NULL, 0.0f, 0.0f, 0, NULL, NULL, 0, NULL, NULL, NULL, 0.0f, 0.0f, ARIA_SCHED_DEFAULT, 0.0f, 0 }
 
 /* Load a model from a directory containing model_config.json + model.safetensors.
  * Returns NULL on error (see aria_last_error()). */

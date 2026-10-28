@@ -92,6 +92,24 @@ GPU, ~330 MB idle included):
 `-s 8 --precision fp32` reproduces the previous default (byte-identical on the GPU; on the CPU within
 the conv-as-GEMM rounding, rel_rmse ≤ 2.1e-7).
 
+### One-shot stage release
+
+A single CLI run frees the text encoder after the prompt and the DiT before the decoder is
+uploaded (`aria_gen_params.oneshot`); resident modes keep both. Output is `cmp`-identical
+(GPU auto/fp32 both models 10/60 s ± prompt; CPU fp32/q8/q4), wall time unchanged. Peak process
+VRAM (`nvidia-smi` minus 332 MB idle) and peak RSS, default settings:
+
+| one-shot run | peak VRAM before → after | peak RSS before → after |
+|---|---|---|
+| GPU small 10 s | 1025 → **727 MB** | |
+| GPU small 60 s | 1927 → **1249 MB** | |
+| GPU medium 10 s | 3085 → **1991 MB** | |
+| GPU medium 60 s | 4343 → **2319 MB** (−47 %) | |
+| GPU small 10 s, prompt | 1025 → 727 MB | 2534 → **2316 MB** |
+| CPU small 10 s, prompt | | 2174 → **1966 MB** |
+| CPU small 60 s, q8 | | 1000 → **708 MB** |
+| CPU medium 10 s, q4 | | 3634 → **2661 MB** (−27 %) |
+
 aria (this runtime) vs **stable-audio-tools** (the PyTorch reference), same machine,
 same model weights, same workload: **uncond, 8-step pingpong, DiT + autoencoder
 decode** (no text encoder — isolates the core diffusion runtime). Both measure

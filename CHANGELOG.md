@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of 8, and on GPUs with int8 tensor cores (sm_75+) a **q8 DiT with int8 activations (W8A8)**
   instead of fp16. These change the output; `-s 8 --precision fp32` reproduces the previous default.
   The CPU default stays fp32: on x86 the int8 paths are slower.
+- A single CLI run frees each stage once it is done (the text encoder after the prompt, the DiT
+  before the decoder is uploaded), so peak memory is the largest stage instead of their sum:
+  GPU VRAM −30 to −47 % (medium 60 s 4.3 → 2.3 GB), CPU RSS −0.2 to −1 GB; output and speed
+  unchanged. `--batch`, `--stream`, `--bench N` and `aria-server` keep everything resident.
+  Library callers opt in with `aria_gen_params.oneshot = 1`.
 
 ### Added
 

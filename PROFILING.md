@@ -14,7 +14,8 @@ $ ARIA_PROFILE=1 ./aria -m "$MODEL" -p "warm piano" -d 10 -s 8 --device cuda -o 
 
 - **prompt** = tokenize + T5Gemma (first prompt also loads it; repeats hit an LRU) ·
   **weights** = the one-time DiT upload (GPU) or overlay build (CPU) · **setup** =
-  per-request conditioning (+ the first request's decoder upload) · **dit** = the
+  per-request conditioning (+ the first request's decoder upload; a single CLI run
+  uploads the decoder only after freeing the DiT, so it lands in decode) · **dit** = the
   denoise loop · **decode** = taae decoder · **sched** = the sampling schedule.
 - **peak RSS** = `getrusage` high-water mark (the mmap'd weights fault in here).
 - **GPU x/y MB** = `cudaMemGetInfo` used/total at the end of the run.

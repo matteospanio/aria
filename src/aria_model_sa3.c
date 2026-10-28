@@ -254,6 +254,20 @@ static int sa3_has_latent_steer(const aria_steer_set *steer) {
     return 0;
 }
 static void sa3_noise(float *out, int n, void *rng) { aria_rng_randn((aria_rng *)rng, out, n); }
+/* upload the decoder once; a NULL result leaves decode on the CPU */
+static void sa3_ensure_cdec(sa3_state *st) {
+    if (st->is_medium) {
+        if (!st->cdec_med) {
+            aria_sa3_dec_medium_view dv; aria_sa3_dec_medium_get_view(st->dec_med, &dv);
+            st->cdec_med = aria_cuda_dec_medium_create(&dv);
+            if (st->cdec_med) fprintf(stderr, "[aria] decoder: GPU device-resident (medium), fp16\n");
+        }
+    } else if (!st->cdec) {
+        aria_sa3_dec_view dv; aria_sa3_dec_get_view(st->dec, &dv);
+        st->cdec = aria_cuda_dec_create(&dv);
+        if (st->cdec) fprintf(stderr, "[aria] decoder: GPU device-resident, fp16\n");
+    }
+}
 #endif
 static void sa3_steer_latent(int step, float *x_CT, int n, void *user) {
     (void)n;   /* == C*T */
@@ -342,6 +356,10 @@ static int sa3_generate(aria_ctx *ctx, void *state,
             int n_real = aria_tokenizer_encode(st->tok, p->prompt, ids, N_PROMPT);
             if (n_real < 0) { aria_set_error("generate: tokenization failed"); free(prompt); return -1; }
             aria_t5enc_encode(st->enc, prompt, ids, N_PROMPT, n_real);
+            if (p->oneshot) {   /* done with the text path: unmap T5, free the vocab */
+                aria_t5enc_free(st->enc); st->enc = NULL;
+                aria_tokenizer_free(st->tok); st->tok = NULL;
+            }
             free(st->emb_lru[victim].prompt);
             st->emb_lru[victim].prompt = strdup(p->prompt);
             if (!st->emb_lru[victim].emb) st->emb_lru[victim].emb = malloc((size_t)N_PROMPT * ED * sizeof(float));
@@ -500,17 +518,7 @@ static int sa3_generate(aria_ctx *ctx, void *state,
         dc.cdit = st->cdit;
         dc.global_seconds = rv.global_seconds;
         dc.gcond = malloc((size_t)6 * st->cfg.embed_dim * sizeof(float));
-        if (st->is_medium) {
-            if (!st->cdec_med) {
-                aria_sa3_dec_medium_view dv; aria_sa3_dec_medium_get_view(st->dec_med, &dv);
-                st->cdec_med = aria_cuda_dec_medium_create(&dv);
-                if (st->cdec_med) fprintf(stderr, "[aria] decoder: GPU device-resident (medium), fp16\n");
-            }
-        } else if (!st->cdec) {
-            aria_sa3_dec_view dv; aria_sa3_dec_get_view(st->dec, &dv);
-            st->cdec = aria_cuda_dec_create(&dv);
-            if (st->cdec) fprintf(stderr, "[aria] decoder: GPU device-resident, fp16\n");
-        }
+        if (!p->oneshot) sa3_ensure_cdec(st);   /* oneshot: after the DiT is freed */
     }
 #endif
     double t1 = sa3_now();
@@ -542,6 +550,16 @@ static int sa3_generate(aria_ctx *ctx, void *state,
     free(dc.gcond);   /* the device handle persists on st; only gcond is per-call */
 #endif
     aria_sa3_dit_req_end(req);
+    /* oneshot: the DiT is done -- free it before the decoder needs its memory */
+    if (p->oneshot) {
+#ifdef ARIA_CUDA
+        if (on_gpu) {
+            aria_cuda_dit_free(st->cdit); st->cdit = NULL;
+            sa3_ensure_cdec(st);
+        }
+#endif
+        if (!on_gpu && quant) { aria_sa3_dit_quantize(st->dit, ARIA_F32); st->quant_loaded = 0; }
+    }
 
     /* decode -> interleaved stereo (GPU if the DiT ran there, else CPU).
      * E16.1: on the CPU, decode long latents in windows (halo-recompute) so peak decode
