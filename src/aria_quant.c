@@ -242,6 +242,14 @@ static void q8a8_vnni(float *y, const uint8_t *xu, const float *sx, const int8_t
 }
 #endif
 
+int aria_cpu_int8_fast(void) {
+#ifdef ARIA_VNNI
+    return 1;   /* measured: i5-1235U small-music DiT 1.8x faster than fp32 */
+#else
+    return 0;   /* AVX2 maddubs (i9-10900KF) measured 1.3-1.4x slower than fp32 */
+#endif
+}
+
 void aria_linear_q8a8(float *y, const float *x, const int8_t *q, const float *scale,
                       const float *b, int M, int K, int N) {
     int8_t *xq = q8a8_tls((size_t)M * K + (size_t)M * sizeof(float) + 64 + (size_t)N * sizeof(int32_t) + 64);

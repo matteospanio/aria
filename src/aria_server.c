@@ -690,6 +690,9 @@ static void probe_capacity(aria_ctx *ctx, const worker_cfg *w, int sessions_set)
     if (g_probe_rtf >= 1.25)
         logline(NULL, "probe: %.1f s window in %.2f s -> chunk %.0f s at %.2fx real time, %d live session%s",
                 st.win_s, st.gen_s, g_chunk, g_probe_rtf, g_max_sessions, g_max_sessions == 1 ? "" : "s");
+    else if (g_probe_rtf >= 1.0)
+        logline(NULL, "probe: %.1f s window in %.2f s -> real time with little headroom: %.2fx at chunk %.0f s "
+                "(expect occasional buffering)", st.win_s, st.gen_s, g_probe_rtf, g_chunk);
     else
         logline(NULL, "probe: %.1f s window in %.2f s -> not real time on this device: best %.2fx at chunk %.0f s "
                 "(clients will buffer; a GPU server streams in real time)", st.win_s, st.gen_s, g_probe_rtf, g_chunk);

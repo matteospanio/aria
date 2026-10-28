@@ -476,8 +476,9 @@ static int sa3_generate(aria_ctx *ctx, void *state,
      * resident RAM; fp32 compute via pack-time widening). On the GPU they map to the
      * existing fp16 device storage as before. */
     aria_dtype prec = (p->precision == ARIA_Q8 || p->precision == ARIA_Q4 || p->precision == ARIA_Q8A8 ||
-                       p->precision == ARIA_F16 || p->precision == ARIA_BF16)
-                      ? p->precision : ARIA_F32;   /* AUTO on the CPU: fp32 (the fastest x86 mode) */
+                       p->precision == ARIA_F16 || p->precision == ARIA_BF16) ? p->precision
+                      : p->precision == ARIA_DTYPE_AUTO && aria_cpu_int8_fast() ? ARIA_Q8A8
+                      : ARIA_F32;   /* AUTO on the CPU: q8a8 with the AVX-VNNI kernel, else fp32 */
     int quant = (prec != ARIA_F32);
 
     /* E9.2: a pre-quantized DiT overlay (.aria from aria-quantize) -> CPU path,
@@ -510,7 +511,8 @@ static int sa3_generate(aria_ctx *ctx, void *state,
         aria_sa3_dit_view view; aria_sa3_dit_get_view(st->dit, &view);  /* f32 view (overlay-independent) */
         /* AUTO on int8-tensor-core GPUs: q8 weights + W8A8 GEMMs -- A/B vs fp16: CLAP
          * non-inferior, wav2taste drift below seed noise; faster and ~1/4 less VRAM */
-        aria_dtype gprec = (p->precision == ARIA_DTYPE_AUTO && aria_cuda_int8_tc()) ? ARIA_Q8A8 : prec;
+        aria_dtype gprec = p->precision != ARIA_DTYPE_AUTO ? prec    /* AUTO resolves per device: */
+                         : aria_cuda_int8_tc() ? ARIA_Q8A8 : ARIA_F32;      /* fp16 below sm_75 */
         st->cdit = aria_cuda_dit_create(&view, gprec);
         const char *how = p->device == ARIA_DEVICE_AUTO ? "auto" : "forced";
         const char *pn = gprec != ARIA_F32 ? aria_dtype_name(gprec) : "fp16";

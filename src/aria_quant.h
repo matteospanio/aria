@@ -49,6 +49,9 @@ void aria_linear_q8(float *y, const float *x, const int8_t *q, const float *scal
  * available), y = acc*sx[m]*scale[n] + b. Faster + ~q4-class fidelity vs q8. */
 void aria_linear_q8a8(float *y, const float *x, const int8_t *q, const float *scale,
                       const float *b, int M, int K, int N);
+/* 1 when this build's CPU int8 GEMM beats fp32 (the AVX-VNNI kernel): --precision auto
+ * then picks q8a8 on the CPU too. */
+int aria_cpu_int8_fast(void);
 
 /* ---- Q4: per-block asymmetric int4 (block = ARIA_Q4_BLOCK), 2 nibbles/byte,
  *      2 floats per block [min, scale] ---- */
