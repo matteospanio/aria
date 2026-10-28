@@ -5,7 +5,10 @@ All notable changes to *aria* are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-10-28
+
+The live REPL release: an endless, steerable music stream from a resident server, a terminal
+client that plays it, and the speed work to run it in real time on a GPU and on a laptop CPU.
 
 ### Changed
 
@@ -15,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the help saying "random"); `--hold` resets its drum loop on every new prompt (only the first change
   did), and with `-o file.wav` writes what `-o -` streams.
 - The prompt-embedding cache holds 32 prompts (was 8).
+- Default denoising steps: 6 on a GPU, **4 when the DiT runs on the CPU** (a third fewer DiT
+  forwards for low-budget machines; `-s` wins; `--fast` is now the 4-step preset). In an A/B on
+  36 streams, 4 steps showed no measurable loss in prompt similarity (+0.007, 95% CI -0.009 to
+  +0.023).
+- `--precision auto` picks q8 + int8 activations on CPUs with the AVX-VNNI kernel (the q8 weights
+  also replace the fp32 copy in RAM: 361 MB instead of ~1.6 GB for small-music).
 - Faster by default, with byte-identical output (checked with `cmp` against the previous build on CPU
   and GPU, both models, 10 s and 60 s). Measured on an i9-10900KF + RTX 3070: CPU 18–22 % faster
   (small 60 s 12.3 → 9.6 s, medium 10 s 10.0 → 7.8 s), GPU 10–24 % faster (small 60 s 0.49 → 0.37 s,
@@ -60,6 +69,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `aria_stream` in libaria: the `--stream` continuation loop as a reusable session (the CLI and
   the server share it); it keeps only the tail it needs, so a stream can run for hours.
 - `aria_wav_header()`, `aria_json_escape()`.
+- Live sessions adapt to the machine: credits ride the stream connection (no TCP connection per
+  credit, which matters through a tunnel), the client buffer (`--buffer`) grows after an
+  underrun, and the server lengthens its chunks (up to 10 s) when it falls behind real time,
+  keeping at least a chunk's generation time buffered.
+- An AVX-VNNI int8 GEMM kernel (Intel 12th gen+, AMD Zen 4+): bit-identical to the existing W8A8
+  path, ~1.8x faster DiT than fp32 on an i5-1235U.
 - `--schedule ref|len|full`: the sampling schedule, now read from the model config. `ref` is what
   `stable_audio_3` `generate()` samples with (LogSNR, rate 0), `len` is aria's previous length-dependent
   schedule (still the default, see BENCHMARKS.md), `full` is the training shift the stable-audio-3
@@ -164,7 +179,8 @@ First public release: a dependency-free C/CUDA runtime for Stable Audio 3.
 - Weight downloader (`download_model.sh`), runnable examples, and benchmark/design notes
   (`README.md`, `BENCHMARKS.md`, `PROFILING.md`).
 
-[Unreleased]: https://github.com/matteospanio/aria/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/matteospanio/aria/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/matteospanio/aria/releases/tag/v0.3.0
 [0.2.1]: https://github.com/matteospanio/aria/releases/tag/v0.2.1
 [0.2.0]: https://github.com/matteospanio/aria/releases/tag/v0.2.0
 [0.1.0]: https://github.com/matteospanio/aria/releases/tag/v0.1.0

@@ -112,14 +112,15 @@ Defaults are tuned for the machine at hand: one OpenMP thread per physical core
 (`ARIA_DEC_WINDOW=<sec>` overrides), and GEMM blocking chosen per shape. None of these
 change the output.
 
-Two defaults do change the output, and are on because they are faster and passed an A/B
+Some defaults do change the output; they are on because they are faster and passed an A/B
 quality check against the exact path (see [BENCHMARKS.md](BENCHMARKS.md)):
 
 | default | where | exact alternative |
 |---|---|---|
-| 6 denoising steps | everywhere | `-s 8` |
-| q8 DiT with int8 activations (`q8a8`) | GPUs with int8 tensor cores (sm_75+) | `--precision fp32` (fp16 storage on the GPU) |
-| fp32 DiT | CPU (the int8 paths are slower on x86) | — |
+| 6 denoising steps | GPU | `-s 8` |
+| 4 denoising steps | CPU (low-budget machines) | `-s 6` / `-s 8` |
+| q8 DiT with int8 activations (`q8a8`) | GPUs with int8 tensor cores (sm_75+), CPUs with AVX-VNNI (Intel 12th gen+, AMD Zen 4+) | `--precision fp32` (fp16 storage on the GPU) |
+| fp32 DiT | other CPUs (their int8 paths are slower) | — |
 
 A single run frees the text encoder and the DiT as soon as each is done, so its peak memory
 is the largest stage rather than the sum (medium 60 s on the GPU: 2.3 GB of VRAM instead of
@@ -166,23 +167,37 @@ aria> ambient pads, slow
 [00:12 ▶ buf 2.3 s · 3.8× · sweet +0.30 · rec ●]
 ```
 
-- **How it streams.** The server generates the music in overlapping chunks (by default 2 s,
-  each conditioned on the last 6 s) and stays about one chunk ahead of what you have heard, so a
-  new prompt or steer lands within a few seconds. `/pause` holds playback (the server waits),
-  `/stop` ends the stream, `/help` lists the rest.
+- **How it streams.** The server generates the music in overlapping chunks, each conditioned on
+  the last 6 s, and sends each one as soon as it is ready; the client buffers a little and plays.
+  A new prompt or steer lands on the next chunk, so the reaction time is about the buffer (a
+  chunk or so). `--buffer` sets it (lower = faster reactions); it grows by itself after an
+  underrun. `/pause` holds playback (the server waits), `/stop` ends the stream, `/help` lists the
+  rest.
 - **Playback** goes through an audio player you already have (`pw-play`, `paplay`, `aplay`,
   sox `play` or `ffplay`, found automatically), or `--player "cmd"`, or `--out -` for raw float
   audio on stdout. `--record` saves everything received as a WAV; `--history` logs each change
   with the time it became audible.
 - **Speed.** At startup the server measures how fast it generates and picks the chunk size and
-  number of simultaneous sessions it can sustain in real time (`GET /info`). An RTX 3070 runs
-  small-music at about 3.8× real time; a CPU-only laptop is slower than real time, so playback
-  pauses to buffer (a larger `--chunk` helps). The real-time target is small-music; medium works
-  but is not real time yet.
+  number of simultaneous sessions it can sustain in real time (`GET /info`); while streaming it
+  keeps measuring and lengthens the chunks (up to 10 s) if it falls behind, since each chunk
+  regenerates a fixed context around what it emits. An RTX 3070 runs small-music at about 6× real
+  time with 2 s chunks; a 15 W laptop CPU (i5-1235U, quiet mode, int8 VNNI kernel, 4 steps)
+  keeps up with 10 s chunks, so changes land ~10 s later there. The real-time target is
+  small-music; medium works but is not real time yet.
 - **Server.** `aria-server` listens on 127.0.0.1 by default (`--bind 0.0.0.0` for the network;
   there is no authentication), logs every request and session event with a timestamp and id
   (`--log`), serves several live sessions plus queued `/generate` requests (`--max-sessions`,
   `--queue`), and exposes the stream protocol in `src/aria_live.h`.
+
+On a laptop, the best of both: run the server on a machine with a GPU and the client locally,
+through an ssh tunnel (measured: 0 underruns and ~1.2 s reactions with `--chunk 1 --buffer 1`
+over a 300 ms tunnel):
+
+```sh
+ssh gpu-box 'aria-server -m models/small-music --steer-dir directions/small --log aria-server.log'   # on the GPU box
+ssh -N -L 8321:127.0.0.1:8321 gpu-box &                                                               # here
+./aria-repl --chunk 1 --buffer 1 --record take.wav
+```
 
 The client and server are POSIX-only for now; the Windows port is in progress.
 
