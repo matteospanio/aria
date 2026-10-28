@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `aria-server` listens on 127.0.0.1 by default instead of every interface (`--bind 0.0.0.0`
+  restores it; the server has no authentication).
+- `--stream` without `--seed` now draws a random seed and prints it (it used one fixed seed, despite
+  the help saying "random"); `--hold` resets its drum loop on every new prompt (only the first change
+  did), and with `-o file.wav` writes what `-o -` streams.
+- The prompt-embedding cache holds 32 prompts (was 8).
 - Faster by default, with byte-identical output (checked with `cmp` against the previous build on CPU
   and GPU, both models, 10 s and 60 s). Measured on an i9-10900KF + RTX 3070: CPU 18–22 % faster
   (small 60 s 12.3 → 9.6 s, medium 10 s 10.0 → 7.8 s), GPU 10–24 % faster (small 60 s 0.49 → 0.37 s,
@@ -41,6 +47,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Live REPL.** `aria-server` live sessions (`POST /stream` + `POST /stream/control`) stream
+  music without end and take prompt, steering, seed, evolve and anchor changes while playing;
+  `aria-repl` is a terminal client that plays them, records (`--record`) and logs changes
+  (`--history`); `scripts/aria-live.sh` starts both. The server stays about one chunk ahead of
+  what was played (client credits), so a change is heard ~2 s later on a GPU.
+- `aria-server`: a deadline-first scheduler serves several live sessions and queued `/generate`
+  jobs (`--max-sessions`, `--queue`, `--max-wait`); a startup capacity probe picks the session
+  chunk size and session count it can sustain (`--no-probe`); named steering directions
+  (`--steer-dir`, `GET /steers`, `"steer":"sweet:0.3"`); a timestamped activity log with
+  request and session ids (`--log`); `--help`.
+- `aria_stream` in libaria: the `--stream` continuation loop as a reusable session (the CLI and
+  the server share it); it keeps only the tail it needs, so a stream can run for hours.
+- `aria_wav_header()`, `aria_json_escape()`.
 - `--schedule ref|len|full`: the sampling schedule, now read from the model config. `ref` is what
   `stable_audio_3` `generate()` samples with (LogSNR, rate 0), `len` is aria's previous length-dependent
   schedule (still the default, see BENCHMARKS.md), `full` is the training shift the stable-audio-3

@@ -143,6 +143,49 @@ hf download matteospanio/aria --local-dir directions
        --steer residual:19:directions/small/sour.atns:0.1:0-7
 ```
 
+## Live REPL
+
+`aria-server` keeps the model loaded and streams music without end; `aria-repl` is a small
+terminal client that plays it and lets you change it while it plays. Type a prompt to start,
+type another at any time to change the music, and steer toward a taste by name:
+
+```sh
+make live                                      # builds aria-server and aria-repl
+hf download matteospanio/aria --local-dir directions
+scripts/aria-live.sh -m models/small-music --steer-dir directions/small -- --record take.wav --history take.jsonl
+```
+
+```
+aria> lo-fi hip hop beat, warm rhodes
+  ▶ 00:00 playing · seed 57227075 · chunk 2 s
+aria> /steer sweet 0.3
+  ↳ 00:05 sweet 0.00 → 0.30  (lands in ~2.1 s)
+  ▶ 00:07 now: sweet 0.00 → 0.30
+aria> ambient pads, slow
+  ↳ 00:10 prompt "ambient pads, slow"  (lands in ~2.8 s)
+[00:12 ▶ buf 2.3 s · 3.8× · sweet +0.30 · rec ●]
+```
+
+- **How it streams.** The server generates the music in overlapping chunks (by default 2 s,
+  each conditioned on the last 6 s) and stays about one chunk ahead of what you have heard, so a
+  new prompt or steer lands within a few seconds. `/pause` holds playback (the server waits),
+  `/stop` ends the stream, `/help` lists the rest.
+- **Playback** goes through an audio player you already have (`pw-play`, `paplay`, `aplay`,
+  sox `play` or `ffplay`, found automatically), or `--player "cmd"`, or `--out -` for raw float
+  audio on stdout. `--record` saves everything received as a WAV; `--history` logs each change
+  with the time it became audible.
+- **Speed.** At startup the server measures how fast it generates and picks the chunk size and
+  number of simultaneous sessions it can sustain in real time (`GET /info`). An RTX 3070 runs
+  small-music at about 3.8× real time; a CPU-only laptop is slower than real time, so playback
+  pauses to buffer (a larger `--chunk` helps). The real-time target is small-music; medium works
+  but is not real time yet.
+- **Server.** `aria-server` listens on 127.0.0.1 by default (`--bind 0.0.0.0` for the network;
+  there is no authentication), logs every request and session event with a timestamp and id
+  (`--log`), serves several live sessions plus queued `/generate` requests (`--max-sessions`,
+  `--queue`), and exposes the stream protocol in `src/aria_live.h`.
+
+The client and server are POSIX-only for now; the Windows port is in progress.
+
 ## Parity and testing
 
 Correctness is checked against the real `stable-audio-tools` PyTorch reference. The `make parity` harness dumps reference tensors from PyTorch and compares them in C with magnitude-aware tolerances. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to run and extend it.
