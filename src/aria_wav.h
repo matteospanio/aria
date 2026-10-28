@@ -29,6 +29,10 @@ int aria_wav_write(const char *path, const aria_audio *a, int bits);
  * For in-memory consumers (e.g. the HTTP server response). */
 int aria_wav_to_mem(const aria_audio *a, int bits, void **out, size_t *out_len);
 
+/* The 44-byte header of a `bits` (16 PCM / 32 float) WAV holding `data_bytes` of samples:
+ * for writers that stream audio to disk and patch the sizes as the file grows. */
+void aria_wav_header(uint8_t h[44], int sample_rate, int ch, int bits, uint32_t data_bytes);
+
 /* Reads PCM16 / PCM24 / PCM32 / float32 WAV into interleaved float. NULL on error. */
 aria_audio *aria_wav_read(const char *path);
 

@@ -28,7 +28,7 @@ jobs:
         run: make example   # compiles examples/generate.c against build/libaria.a
 
       - name: Live server (POSIX)
-        run: make live && ./aria-server --help
+        run: make live && ./aria-server --help && ./aria-repl --help
 
   # MSVC build of the same sources + the same hermetic tests (build.bat = the Makefile's
   # Windows counterpart). The MSVC build compiles the scalar, single-threaded CPU path.

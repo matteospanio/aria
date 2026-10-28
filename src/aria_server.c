@@ -925,6 +925,7 @@ int main(int argc, char **argv) {
         } else { usage(stderr, argv[0]); return 1; }
     }
     if (!model_dir) { usage(stderr, argv[0]); return 1; }
+    if (isatty(2)) fprintf(stderr, "\n%s  live music generation server\n\n", aria_banner());
     g_log = stderr;
     if (log_path && !(g_log = fopen(log_path, "a"))) { fprintf(stderr, "aria-server: cannot open log %s\n", log_path); return 1; }
     setvbuf(g_log, NULL, _IOLBF, 0);

@@ -55,4 +55,13 @@ static inline int64_t live_lands(int64_t sent, int busy, int64_t emit_fr) {
     return busy ? sent + emit_fr : sent;
 }
 
+/* the startup banner aria-server and aria-repl print on a terminal */
+static inline const char *aria_banner(void) {
+    return "            _\n"
+           "  __ _ _ __(_) __ _\n"
+           " / _` | '__| |/ _` |\n"
+           "| (_| | |  | | (_| |\n"
+           " \\__,_|_|  |_|\\__,_|\n";
+}
+
 #endif /* ARIA_LIVE_H */

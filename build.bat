@@ -24,10 +24,10 @@ if /i "%~1"=="cuda" (
     for %%i in (nvcc.exe) do set "CUDA_LINK=build\aria_cuda.obj /LIBPATH:"%%~dp$PATH:i..\lib\x64" cudart_static.lib cublas.lib"
 )
 
-rem libaria: every src\*.c except the CLI entry point and the POSIX-only HTTP server
+rem libaria: every src\*.c except the CLI entry point and the POSIX-only server and REPL
 set "SRCS="
 set "OBJS="
-for %%f in (src\*.c) do if /i not "%%~nxf"=="main.c" if /i not "%%~nxf"=="aria_server.c" (
+for %%f in (src\*.c) do if /i not "%%~nxf"=="main.c" if /i not "%%~nxf"=="aria_server.c" if /i not "%%~nxf"=="aria_repl.c" (
     set "SRCS=!SRCS! %%f"
     set "OBJS=!OBJS! build\%%~nf.obj"
 )

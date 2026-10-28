@@ -134,13 +134,17 @@ aria: $(BUILD)/main.o $(LIB)
 aria-server: $(BUILD)/aria_server.o $(LIB)
 	$(CC) $(CFLAGS) -I$(SRC) $(BUILD)/aria_server.o -L$(BUILD) -laria $(LDFLAGS) -lpthread -o $@
 
-# live REPL stack: the streaming server (+ the aria-repl client, C8)
-live: aria-server
+# interactive client for the server's live sessions (POSIX: sockets, termios, posix_spawn)
+aria-repl: $(BUILD)/aria_repl.o $(LIB)
+	$(CC) $(CFLAGS) -I$(SRC) $(BUILD)/aria_repl.o -L$(BUILD) -laria $(LDFLAGS) -lpthread -o $@
+
+# live REPL stack: the streaming server + its client
+live: aria-server aria-repl
 
 # ---- tests ----
 TESTS := test_ops test_wav test_config test_sampler test_arena test_quant test_rng test_lora test_taae test_gemm test_stream test_live
 # POSIX-only (sockets, dirent): run by `make test`, not by build.bat (it reads TESTS only)
-POSIX_TESTS := test_server
+POSIX_TESTS := test_server test_repl
 test: $(LIB)
 	@set -e; \
 	for t in $(TESTS) $(POSIX_TESTS); do \
@@ -194,4 +198,4 @@ test_cuda:
 	$(BUILD)/test_cuda
 
 clean:
-	rm -rf $(BUILD) aria aria-quantize aria-server example
+	rm -rf $(BUILD) aria aria-quantize aria-server aria-repl example
