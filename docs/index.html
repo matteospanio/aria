@@ -149,8 +149,8 @@ footer .tab { position: absolute; right: 0; bottom: 0; height: 80px; }
 
 <main class="wrap">
   <div class="kpis">
-    <div class="kpi"><b>7×</b><span>faster cold start</span><small>1.6 s vs 11.6 s, same checkpoints</small></div>
-    <div class="kpi"><b>0.13 s</b><span>per 10 s clip, warm</span><small>RTX 3070; official stack 0.146 s</small></div>
+    <div class="kpi"><b>15×</b><span>faster cold start</span><small>0.75 s vs 11.6 s, same checkpoints</small></div>
+    <div class="kpi"><b>0.10 s</b><span>per 10 s clip, warm</span><small>RTX 3070, 8 steps; official stack 0.146 s</small></div>
     <div class="kpi"><b>2.3×</b><span>less Pi memory at 8-bit</span><small>1.9 → 0.84 GB, within re-seed noise</small></div>
     <div class="kpi"><b>1.2 B</b><span>params on a Raspberry Pi 5</span><small>medium model, 4-bit, 8 GB board</small></div>
   </div>
@@ -159,11 +159,11 @@ footer .tab { position: absolute; right: 0; bottom: 0; height: 80px; }
     <h2>What aria is</h2>
     <p>Open-weight music models are now good enough for interactive tools and edge devices, but their
     reference implementations assume a Python/PyTorch stack and a discrete GPU. <strong>aria</strong> is a
-    dependency-free runtime in about 7.7k lines of C and CUDA that runs the complete Stable Audio 3
+    dependency-free runtime in about 8.8k lines of C and CUDA that runs the complete Stable Audio 3
     text-to-music pipeline (tokenizer, T5Gemma text encoder, diffusion transformer, autoencoder) on
     ordinary GPUs, CPU-only machines and a Raspberry Pi 5.</p>
     <figure>
-      <div class="plate"><img class="narrow" src="img/overview.svg" alt="Diagram: the same Stable Audio 3 checkpoints move from a framework-bound PyTorch stack (11.6–22.2 s cold start, out of memory at load on 8 GB, 15–48 s compile per clip length) to a single aria binary (1.6–2.9 s cold start, 0.13 s warm, both models on a Raspberry Pi 5). Steering can be injected at the DiT residual stream, the latent, or the text conditioning."></div>
+      <div class="plate"><img src="img/overview-web.svg" width="960" height="524" alt="Diagram: the same Stable Audio 3 checkpoints move from a framework-bound PyTorch stack (11.6–22.2 s cold start, out of memory at load on 8 GB, 15–48 s compile per clip length) to a single aria binary (0.75–1.65 s cold start, 13 times faster; 0.10 s warm, 1.5 times faster; both models on a Raspberry Pi 5). Steering can be injected at the DiT residual stream, the latent, or the text conditioning."></div>
       <figcaption>Same checkpoints, moved from a framework-bound serving stack to one binary on hardware people
       own. Because the runtime owns every tensor, activation steering becomes a built-in feature, injected
       at <span class="site1">①</span> the DiT residual stream, <span class="site2">②</span>
@@ -176,7 +176,7 @@ footer .tab { position: absolute; right: 0; bottom: 0; height: 80px; }
       <li><strong>Quantization that saves memory.</strong> Weights from fp16 down to 8- or 4-bit; the full-precision copy is released
         once packed, so a lower precision replaces the footprint instead of adding to it.</li>
       <li><strong>Long-form and serving.</strong> Windowed and streaming decoders with byte-identical output; a resident batch mode and an
-        HTTP server keep the model loaded (0.60 s per job vs 1.23 s per invocation).</li>
+        HTTP server keep the model loaded (0.10 s per job vs 0.75 s for a one-shot run).</li>
     </ul>
   </section>
 
@@ -255,17 +255,19 @@ footer .tab { position: absolute; right: 0; bottom: 0; height: 80px; }
           <tr><th>10 s clip, 8 steps, steering on</th><th>time (s)</th><th>VRAM (MB)</th><th>time (s)</th><th>VRAM (MB)</th></tr>
         </thead>
         <tbody>
-          <tr class="ours"><td>aria GPU, warm</td><td>0.13</td><td>1395</td><td>0.37</td><td>4215</td></tr>
+          <tr class="ours"><td>aria GPU, warm</td><td>0.10</td><td>1395</td><td>0.29</td><td>4215</td></tr>
           <tr class="ref"><td>SA3 GPU, warm</td><td>0.146</td><td>2330</td><td>0.443</td><td>5948</td></tr>
-          <tr class="ours"><td>aria cold start</td><td>1.6</td><td>–</td><td>2.9</td><td>–</td></tr>
+          <tr class="ours"><td>aria cold start</td><td>0.75</td><td>–</td><td>1.65</td><td>–</td></tr>
           <tr class="ref"><td>SA3 cold start</td><td>11.58</td><td>–</td><td>22.23</td><td>–</td></tr>
-          <tr class="ours"><td>aria CPU-only (20 threads)</td><td>2.5</td><td>–</td><td>9.8</td><td>–</td></tr>
+          <tr class="ours"><td>aria CPU-only (10 cores)</td><td>2.0</td><td>–</td><td>7.9</td><td>–</td></tr>
         </tbody>
       </table>
     </div>
     <p class="note">RTX 3070 (8 GB) with an i9-10900KF. Warm = model already resident on both sides; cold = process
     spawn + weight load + one generation. The official stack's compiler recompiles for each new clip length
-    (14.5–48.1 s), and its medium loader briefly needs ~7.1 GB, overflowing an 8 GB card.</p>
+    (14.5–48.1 s), and its medium loader briefly needs ~7.1 GB, overflowing an 8 GB card. aria rows
+    re-measured on the current release with the same workload (VRAM unchanged). With its defaults (6 steps,
+    8-bit W8A8 on the tensor cores) the same clip takes 0.06 s (small) and 0.18 s (medium) warm.</p>
 
     <h3>Quantization is close to free at 8-bit</h3>
     <div class="two">
@@ -277,7 +279,7 @@ footer .tab { position: absolute; right: 0; bottom: 0; height: 80px; }
         <table>
           <thead><tr><th>small-music</th><th>fp16</th><th>q8</th><th>W8A8</th><th>q4</th></tr></thead>
           <tbody>
-            <tr><td>GPU warm (s)</td><td>0.13</td><td>0.20</td><td class="ok">0.10</td><td>0.22</td></tr>
+            <tr><td>GPU warm (s)</td><td>0.10</td><td>0.14</td><td class="ok">0.07</td><td>0.14</td></tr>
             <tr><td>VRAM (MB)</td><td>1510</td><td>1190</td><td>1190</td><td>1128</td></tr>
             <tr><td>Pi 5 peak (MB)</td><td>1198</td><td>836</td><td>836</td><td>776</td></tr>
             <tr><td>ΔCLAP (±0.004)</td><td>ref</td><td class="ok">+0.002</td><td class="ok">−0.001</td><td class="no">−0.020</td></tr>
@@ -286,7 +288,7 @@ footer .tab { position: absolute; right: 0; bottom: 0; height: 80px; }
           </tbody>
         </table>
         <p class="note">In brackets: the re-seed noise floor of each check. 8-bit stays inside all three;
-        W8A8 (8-bit arithmetic on integer tensor cores) is the fastest GPU mode. 4-bit crosses every floor,
+        W8A8 (8-bit arithmetic on integer tensor cores) is the fastest GPU mode and the default on such GPUs. 4-bit crosses every floor,
         but it is what puts the 1.2 B medium model on an 8 GB Pi (~200 s; 0.9 GB resident).</p>
       </div>
     </div>
