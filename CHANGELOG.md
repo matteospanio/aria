@@ -71,8 +71,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `--continue` / `--inpaint` / `--stream` on the medium model now fail with a clear error instead of
-  encoding garbage: only the small models' 768-d SAME-S encoder is implemented.
+- `--continue` / `--inpaint` / `--stream` now work on the **medium** model: its 1536-d SAME-L
+  encoder is implemented (parity vs the official stable_audio_3: rel_rmse ~2e-6). Before, medium
+  encoded garbage with the small model's encoder. Medium streaming runs at about 1.1× real time on
+  an RTX 3070 (the encoder still runs on the CPU).
+- Small-model continuation read its context latent with the wrong stride whenever the window
+  length in latent frames was odd, which includes every `--stream` chunk at the default 2 s: each
+  latent channel came out shifted, so chunks were conditioned on a scrambled context. Output
+  changes for those cases (even lengths are unchanged); in an A/B on 36 streams, how closely the
+  continuation follows its own opening rose from 0.57 to 0.68 (CLAP audio similarity, 95% CI
+  +0.02 to +0.20).
+- Continuation encodes only the kept audio plus the encoder's receptive field instead of the
+  whole window (the rest is masked out anyway): about half the encoder work per stream chunk,
+  same output.
 
 ## [0.2.1] - 2026-10-22
 
