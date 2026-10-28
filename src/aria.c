@@ -127,6 +127,7 @@ void aria_list_tensors(const aria_ctx *ctx, const char *prefix) {
     printf("(%d tensors%s%s)\n", shown, prefix ? " under prefix " : "", prefix ? prefix : "");
 }
 
+#ifdef _OPENMP
 /* physical cores = distinct SMT sibling sets (0 when the topology is unreadable) */
 static int physical_cores(void) {
     static int n = -1;
@@ -148,6 +149,7 @@ static int physical_cores(void) {
     n = k;
     return n;
 }
+#endif
 
 int aria_generate(aria_ctx *ctx, const aria_gen_params *p, aria_audio **out) {
     if (!ctx || !ctx->module || !ctx->module->generate) {
