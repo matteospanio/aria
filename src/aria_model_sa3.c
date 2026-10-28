@@ -58,10 +58,10 @@ typedef struct {
     /* text path (lazily loaded on first text prompt) */
     aria_t5enc *enc;
     aria_tokenizer *tok;
-    /* A3: small LRU of prompt embeddings (was a single slot that thrashed when jobs
-     * cycle 2+ prompts -- batch runs, steering sweeps). Each avoided re-encode saves a
-     * full CPU T5Gemma forward (~0.2-0.35 s). */
-#define SA3_EMB_LRU 8
+    /* A3: LRU of prompt embeddings (was a single slot that thrashed when jobs cycle 2+
+     * prompts -- batch runs, steering sweeps, a live REPL's prompt history). Each hit
+     * skips a CPU T5Gemma forward; entries are 0.8 MB and filled lazily (<= 25 MB). */
+#define SA3_EMB_LRU 32
     struct { char *prompt; float *emb; uint64_t stamp; } emb_lru[SA3_EMB_LRU];
     uint64_t emb_clock;
     /* persistent device DiT + decoder (weights uploaded once, reused across generations) */
